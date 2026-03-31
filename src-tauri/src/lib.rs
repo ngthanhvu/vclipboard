@@ -2,12 +2,16 @@ use chrono::{Local, TimeZone};
 use directories::ProjectDirs;
 use eframe::{
     egui::{
-        self, Align, Button, Color32, Context, Frame, Layout, Margin, RichText, ScrollArea,
-        Stroke, TextEdit, TopBottomPanel, Ui, Vec2,
+        self, Align, Align2, Button, Color32, Context, Frame, Layout, Margin, RichText, Stroke,
+        TextEdit, TopBottomPanel, Ui, Vec2, ViewportCommand,
     },
     App, CreationContext, NativeOptions,
 };
 use egui_extras::{Column, TableBuilder};
+use global_hotkey::{
+    hotkey::HotKey,
+    GlobalHotKeyEvent, GlobalHotKeyManager,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -21,6 +25,10 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuId, MenuItem},
+    Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
+};
 
 const MAX_HISTORY_ITEMS: usize = 250;
 const POLL_INTERVAL_MS: u64 = 900;
@@ -33,6 +41,28 @@ struct ClipboardEntry {
     created_at: u64,
     character_count: usize,
     line_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppSettings {
+    hotkey: String,
+    start_hidden_in_tray: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            hotkey: String::from("Ctrl+Shift+V"),
+            start_hidden_in_tray: false,
+        }
+    }
+}
+
+struct TrayHandles {
+    _tray: TrayIcon,
+    show_hide_id: MenuId,
+    settings_id: MenuId,
+    quit_id: MenuId,
 }
 
 struct HistoryStore {
@@ -149,6 +179,19 @@ struct ClipboardDiaryApp {
     search: String,
     selected_id: Option<String>,
     status_message: String,
+    settings: AppSettings,
+    show_settings: bool,
+    hotkey_manager: Option<GlobalHotKeyManager>,
+    registered_hotkey: Option<HotKey>,
+    tray: Option<TrayHandles>,
+    tray_error: Option<String>,
+    window_visible: bool,
+    quit_requested: bool,
+    startup_hide_pending: bool,
+    start_hidden_requested: bool,
+    start_hidden_effective: bool,
+    settings_hotkey_input: String,
+    settings_start_hidden: bool,
 }
 
 impl ClipboardDiaryApp {
@@ -158,14 +201,55 @@ impl ClipboardDiaryApp {
         let storage_path = app_storage_path();
         let store = Arc::new(HistoryStore::new(storage_path));
         store.start_monitor(cc.egui_ctx.clone());
+        let settings = load_settings(&settings_path());
+        let hotkey_manager = GlobalHotKeyManager::new().ok();
+        let (tray, tray_error) = match create_tray() {
+            Ok(tray) => (Some(tray), None),
+            Err(error) => (None, Some(error)),
+        };
+        let settings_hotkey_input = settings.hotkey.clone();
+        let settings_start_hidden = settings.start_hidden_in_tray;
+        let startup_hidden = settings.start_hidden_in_tray;
+        let tray_available = tray.is_some();
+        let startup_hide_pending = startup_hidden && tray_available;
+        let initial_status = if let Some(error) = tray_error.as_ref() {
+            format!("Tray icon unavailable, starting visible: {error}")
+        } else if startup_hide_pending {
+            String::from("Tray icon ready, startup hide armed")
+        } else if startup_hidden {
+            String::from("Start hidden requested, but skipped for safety")
+        } else {
+            String::from("Ready")
+        };
 
         let selected_id = store.history().first().map(|entry| entry.id.clone());
-        Self {
+        let mut app = Self {
             store,
             search: String::new(),
             selected_id,
-            status_message: String::from("Ready"),
+            status_message: initial_status,
+            settings,
+            show_settings: false,
+            hotkey_manager,
+            registered_hotkey: None,
+            tray,
+            tray_error,
+            window_visible: true,
+            quit_requested: false,
+            startup_hide_pending,
+            start_hidden_requested: startup_hidden,
+            start_hidden_effective: startup_hide_pending,
+            settings_hotkey_input,
+            settings_start_hidden,
+        };
+        app.apply_hotkey_setting();
+        if app.tray.is_none() {
+            app.status_message =
+                String::from("Tray icon unavailable, starting visible for safety");
+        } else if app.start_hidden_requested && !app.start_hidden_effective {
+            app.status_message = String::from("Start hidden skipped for safety");
         }
+        app
     }
 
     fn filtered_history(&self) -> Vec<ClipboardEntry> {
@@ -237,6 +321,177 @@ impl ClipboardDiaryApp {
         }
     }
 
+    fn toggle_visibility(&mut self, ctx: &Context) {
+        self.window_visible = !self.window_visible;
+        if self.window_visible {
+            apply_window_visibility(ctx, true);
+            self.status_message = String::from("Clipboard Diary shown");
+        } else {
+            self.hide_window(ctx);
+        }
+    }
+
+    fn show_window(&mut self, ctx: &Context) {
+        self.window_visible = true;
+        apply_window_visibility(ctx, true);
+        self.status_message = String::from("Clipboard Diary shown");
+    }
+
+    fn hide_window(&mut self, ctx: &Context) {
+        if self.tray.is_none() {
+            self.window_visible = true;
+            self.status_message =
+                String::from("Tray icon unavailable, cannot hide window to tray");
+            return;
+        }
+        self.window_visible = false;
+        apply_window_visibility(ctx, false);
+        self.status_message = String::from("Clipboard Diary hidden to tray");
+    }
+
+    fn apply_hotkey_setting(&mut self) {
+        let Some(manager) = self.hotkey_manager.as_ref() else {
+            self.status_message = String::from("Global hotkey is not available on this system");
+            if self.start_hidden_requested {
+                self.start_hidden_effective = false;
+                self.startup_hide_pending = false;
+            }
+            return;
+        };
+
+        if let Some(current) = self.registered_hotkey.take() {
+            let _ = manager.unregister(current);
+        }
+
+        match parse_hotkey_setting(&self.settings.hotkey) {
+            Ok(Some(hotkey)) => match manager.register(hotkey.clone()) {
+                Ok(()) => {
+                    self.registered_hotkey = Some(hotkey);
+                    let _ = save_settings(&settings_path(), &self.settings);
+                    self.status_message =
+                        format!("Hotkey set to {}", self.settings.hotkey.as_str());
+                }
+                Err(error) => {
+                    self.start_hidden_effective = false;
+                    self.startup_hide_pending = false;
+                    self.status_message =
+                        format!(
+                            "Could not register hotkey '{}': {error}. Starting visible for safety",
+                            self.settings.hotkey
+                        );
+                }
+            },
+            Ok(None) => {
+                let _ = save_settings(&settings_path(), &self.settings);
+                self.status_message = String::from("Global hotkey disabled");
+            }
+            Err(error) => {
+                self.start_hidden_effective = false;
+                self.startup_hide_pending = false;
+                self.status_message = error;
+            }
+        }
+    }
+
+    fn handle_external_events(&mut self, ctx: &Context) {
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if let Some(tray) = self.tray.as_ref() {
+                if event.id == tray.show_hide_id {
+                    self.toggle_visibility(ctx);
+                } else if event.id == tray.settings_id {
+                    self.show_window(ctx);
+                    self.show_settings = true;
+                } else if event.id == tray.quit_id {
+                    self.quit_requested = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+        }
+
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::DoubleClick { button, .. } = event {
+                if button == MouseButton::Left {
+                    self.toggle_visibility(ctx);
+                }
+            }
+        }
+
+        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            if self
+                .registered_hotkey
+                .as_ref()
+                .map(|hotkey| hotkey.id() == event.id)
+                .unwrap_or(false)
+            {
+                self.toggle_visibility(ctx);
+            }
+        }
+    }
+
+    fn settings_window(&mut self, ctx: &Context) {
+        if !self.show_settings {
+            return;
+        }
+
+        let mut open = self.show_settings;
+        egui::Window::new("Settings")
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("Global hotkey to show / hide Clipboard Diary");
+                ui.add_sized(
+                    [220.0, 24.0],
+                    TextEdit::singleline(&mut self.settings_hotkey_input)
+                        .hint_text("Ctrl+Shift+V, Alt+Space, F8..."),
+                );
+                ui.add_space(4.0);
+                ui.add_enabled_ui(self.tray.is_some(), |ui| {
+                    ui.checkbox(&mut self.settings_start_hidden, "Start hidden in tray");
+                });
+                if let Some(error) = self.tray_error.as_ref() {
+                    ui.label(
+                        RichText::new(format!("Tray unavailable: {error}"))
+                            .size(11.0)
+                            .color(Color32::from_rgb(150, 72, 52)),
+                    );
+                } else if self.start_hidden_requested && !self.start_hidden_effective {
+                    ui.label(
+                        RichText::new("Start hidden was skipped for safety")
+                            .size(11.0)
+                            .color(Color32::from_rgb(150, 72, 52)),
+                    );
+                }
+                ui.label(
+                    RichText::new("Examples: Ctrl+Shift+V, Ctrl+Alt+V, Alt+Space, F8")
+                        .size(11.0)
+                        .color(Color32::from_rgb(88, 88, 88)),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        self.settings.hotkey = self.settings_hotkey_input.trim().to_string();
+                        self.settings.start_hidden_in_tray =
+                            self.settings_start_hidden && self.tray.is_some();
+                        self.start_hidden_requested = self.settings.start_hidden_in_tray;
+                        self.start_hidden_effective =
+                            self.start_hidden_requested && self.tray.is_some();
+                        self.startup_hide_pending = false;
+                        self.apply_hotkey_setting();
+                        self.show_settings = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.settings = load_settings(&settings_path());
+                        self.settings_hotkey_input = self.settings.hotkey.clone();
+                        self.settings_start_hidden = self.settings.start_hidden_in_tray;
+                        self.show_settings = false;
+                    }
+                });
+            });
+        self.show_settings = open;
+    }
+
     fn top_toolbar(&mut self, ctx: &Context) {
         TopBottomPanel::top("toolbar")
             .exact_height(38.0)
@@ -257,6 +512,11 @@ impl ClipboardDiaryApp {
                     }
                     if ui.add(Button::new("Clear all")).clicked() {
                         self.clear_history();
+                    }
+                    if ui.add(Button::new("Settings")).clicked() {
+                        self.settings_hotkey_input = self.settings.hotkey.clone();
+                        self.settings_start_hidden = self.settings.start_hidden_in_tray;
+                        self.show_settings = true;
                     }
                     ui.separator();
                     ui.add_space(2.0);
@@ -280,6 +540,11 @@ impl ClipboardDiaryApp {
     }
 
     fn bottom_bar(&mut self, ctx: &Context, visible_count: usize, total_count: usize) {
+        let selected_summary = self
+            .selected_entry(&self.filtered_history())
+            .map(|entry| format!("{} chars | {} lines", entry.character_count, entry.line_count))
+            .unwrap_or_else(|| String::from("No selection"));
+
         TopBottomPanel::bottom("status_bar")
             .frame(
                 Frame::new()
@@ -299,6 +564,10 @@ impl ClipboardDiaryApp {
                     );
                     ui.separator();
                     ui.label(
+                        RichText::new(selected_summary).color(Color32::from_rgb(55, 55, 55)),
+                    );
+                    ui.separator();
+                    ui.label(
                         RichText::new(&self.status_message).color(Color32::from_rgb(55, 55, 55)),
                     );
                 });
@@ -312,179 +581,159 @@ impl ClipboardDiaryApp {
         let selected_id = self.selected_entry(&items).map(|entry| entry.id.clone());
         let compact = ui.available_width() < 520.0;
 
-        ui.vertical(|ui| {
-            Frame::group(ui.style())
-                .inner_margin(Margin::same(6))
-                .show(ui, |ui| {
-                    let mut table = TableBuilder::new(ui)
-                        .striped(true)
-                        .resizable(false)
-                        .cell_layout(Layout::left_to_right(Align::Center))
-                        .column(Column::exact(24.0))
-                        .column(Column::remainder());
+        Frame::group(ui.style())
+            .inner_margin(Margin::same(6))
+            .show(ui, |ui| {
+                let mut table = TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(false)
+                    .cell_layout(Layout::left_to_right(Align::Center))
+                    .column(Column::exact(24.0))
+                    .column(Column::remainder());
 
-                    if !compact {
-                        table = table.column(Column::exact(92.0));
-                    }
+                if !compact {
+                    table = table.column(Column::exact(92.0));
+                }
 
-                    table.header(20.0, |mut header| {
-                            header.col(|ui| {
-                                ui.label(RichText::new("#").strong().color(Color32::from_rgb(48, 48, 48)));
-                            });
+                table
+                    .header(20.0, |mut header| {
+                        header.col(|ui| {
+                            ui.label(RichText::new("#").strong().color(Color32::from_rgb(48, 48, 48)));
+                        });
+                        header.col(|ui| {
+                            ui.label(
+                                RichText::new("Clipboard history")
+                                    .strong()
+                                    .color(Color32::from_rgb(48, 48, 48)),
+                            );
+                        });
+                        if !compact {
                             header.col(|ui| {
                                 ui.label(
-                                    RichText::new("Clipboard history")
+                                    RichText::new("Captured")
                                         .strong()
                                         .color(Color32::from_rgb(48, 48, 48)),
                                 );
                             });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(22.0, items.len(), |mut row| {
+                            let index = row.index();
+                            let entry = &items[index];
+                            let is_selected = selected_id
+                                .as_ref()
+                                .map(|current| current == &entry.id)
+                                .unwrap_or(false);
+
+                            row.col(|ui| {
+                                let icon = if entry.line_count > 1 { "S" } else { "T" };
+                                let text = RichText::new(icon)
+                                    .strong()
+                                    .color(Color32::from_rgb(0, 70, 160));
+                                ui.label(text);
+                            });
+
+                            row.col(|ui| {
+                                let preview_text = if compact {
+                                    truncate(&entry.preview, 40)
+                                } else {
+                                    truncate(&entry.preview, 86)
+                                };
+                                let row_text = RichText::new(preview_text).color(if is_selected {
+                                    Color32::WHITE
+                                } else {
+                                    Color32::from_rgb(38, 38, 38)
+                                });
+                                let response = ui
+                                    .allocate_ui_with_layout(
+                                        Vec2::new(ui.available_width(), 18.0),
+                                        Layout::left_to_right(Align::Center),
+                                        |ui| ui.selectable_label(is_selected, row_text),
+                                    )
+                                    .inner
+                                    .on_hover_text(&entry.preview);
+                                if response.clicked() {
+                                    self.selected_id = Some(entry.id.clone());
+                                }
+                                if response.double_clicked() {
+                                    match self.store.copy_entry(&entry.id) {
+                                        Ok(()) => {
+                                            self.status_message = format!(
+                                                "Copied '{}' back to clipboard",
+                                                truncate(&entry.preview, 36)
+                                            );
+                                        }
+                                        Err(error) => self.status_message = error,
+                                    }
+                                }
+                                response.context_menu(|ui| {
+                                    if ui.button("Copy to clipboard").clicked() {
+                                        let _ = self.store.copy_entry(&entry.id);
+                                        self.status_message = String::from("Copied selected clip");
+                                        ui.close();
+                                    }
+                                    if ui.button("Delete").clicked() {
+                                        let _ = self.store.delete_entry(&entry.id);
+                                        self.status_message = String::from("Deleted selected clip");
+                                        self.selected_id = None;
+                                        ui.close();
+                                    }
+                                });
+                            });
+
                             if !compact {
-                                header.col(|ui| {
+                                row.col(|ui| {
+                                    let color = if is_selected {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_gray(90)
+                                    };
                                     ui.label(
-                                        RichText::new("Captured")
-                                            .strong()
-                                            .color(Color32::from_rgb(48, 48, 48)),
+                                        RichText::new(format_timestamp(entry.created_at)).color(color),
                                     );
                                 });
                             }
-                        })
-                        .body(|body| {
-                            body.rows(22.0, items.len(), |mut row| {
-                                let index = row.index();
-                                let entry = &items[index];
-                                let is_selected = selected_id
-                                    .as_ref()
-                                    .map(|current| current == &entry.id)
-                                    .unwrap_or(false);
-
-                                row.col(|ui| {
-                                    let icon = if entry.line_count > 1 { "S" } else { "T" };
-                                    let text = if is_selected {
-                                        RichText::new(icon).strong().color(Color32::WHITE)
-                                    } else {
-                                        RichText::new(icon).strong().color(Color32::from_rgb(0, 70, 160))
-                                    };
-                                    ui.label(text);
-                                });
-
-                                row.col(|ui| {
-                                    let preview_text = if compact {
-                                        truncate(&entry.preview, 40)
-                                    } else {
-                                        truncate(&entry.preview, 86)
-                                    };
-                                    let response = ui
-                                        .allocate_ui_with_layout(
-                                            Vec2::new(ui.available_width(), 18.0),
-                                            Layout::left_to_right(Align::Center),
-                                            |ui| ui.selectable_label(is_selected, preview_text),
-                                        )
-                                        .inner
-                                        .on_hover_text(&entry.preview);
-                                    if response.clicked() {
-                                        self.selected_id = Some(entry.id.clone());
-                                    }
-                                    if response.double_clicked() {
-                                        match self.store.copy_entry(&entry.id) {
-                                            Ok(()) => {
-                                                self.status_message = format!(
-                                                    "Copied '{}' back to clipboard",
-                                                    truncate(&entry.preview, 36)
-                                                );
-                                            }
-                                            Err(error) => self.status_message = error,
-                                        }
-                                    }
-                                    response.context_menu(|ui| {
-                                        if ui.button("Copy to clipboard").clicked() {
-                                            let _ = self.store.copy_entry(&entry.id);
-                                            self.status_message = String::from("Copied selected clip");
-                                            ui.close();
-                                        }
-                                        if ui.button("Delete").clicked() {
-                                            let _ = self.store.delete_entry(&entry.id);
-                                            self.status_message = String::from("Deleted selected clip");
-                                            self.selected_id = None;
-                                            ui.close();
-                                        }
-                                    });
-                                });
-
-                                if !compact {
-                                    row.col(|ui| {
-                                        let color = if is_selected {
-                                            Color32::WHITE
-                                        } else {
-                                            Color32::from_gray(90)
-                                        };
-                                        ui.label(
-                                            RichText::new(format_timestamp(entry.created_at)).color(color),
-                                        );
-                                    });
-                                }
-                            });
                         });
-                });
-
-            ui.add_space(6.0);
-            Frame::group(ui.style())
-                .inner_margin(Margin::same(8))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new("Preview")
-                                .strong()
-                                .color(Color32::from_rgb(45, 45, 45)),
-                        );
-                        ui.separator();
-                        if let Some(entry) = self.selected_entry(&items) {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} chars | {} lines",
-                                    entry.character_count, entry.line_count
-                                ))
-                                .color(Color32::from_rgb(60, 60, 60)),
-                            );
-                            ui.separator();
-                            if ui.button("Copy").clicked() {
-                                self.copy_selected(&items);
-                            }
-                            if ui.button("Delete").clicked() {
-                                self.delete_selected(&items);
-                            }
-                        } else {
-                            ui.label("No clip selected");
-                        }
                     });
-                    ui.separator();
 
-                    let preview_height = (ui.available_height() - 6.0).max(120.0);
-                    ScrollArea::vertical()
-                        .max_height(preview_height)
-                        .show(ui, |ui| {
-                            if let Some(entry) = self.selected_entry(&items) {
-                                let mut preview_text = entry.content.clone();
-                                ui.add_sized(
-                                    [ui.available_width(), preview_height],
-                                    TextEdit::multiline(&mut preview_text)
-                                        .font(egui::TextStyle::Monospace)
-                                        .desired_width(f32::INFINITY)
-                                        .interactive(false),
-                                );
-                            } else if total_items == 0 {
-                                ui.label("Clipboard history is empty. Copy any text in Windows to start.");
-                            } else {
-                                ui.label("No clip matches the current search.");
-                            }
-                        });
-                });
-        });
+                if total_items == 0 {
+                    ui.add_space(8.0);
+                    ui.label("Clipboard history is empty. Copy any text in Windows to start.");
+                }
+            });
     }
 
 }
 
 impl App for ClipboardDiaryApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.handle_external_events(ctx);
+
+        if self.startup_hide_pending {
+            self.startup_hide_pending = false;
+            if self.start_hidden_requested && self.start_hidden_effective && self.tray.is_some() {
+                self.hide_window(ctx);
+            } else {
+                self.window_visible = true;
+                if self.tray.is_none() {
+                    self.status_message =
+                        String::from("Start hidden skipped for safety because tray is unavailable");
+                }
+            }
+        }
+
+        if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            if self.tray.is_some() {
+                self.hide_window(ctx);
+            } else {
+                self.status_message =
+                    String::from("Tray icon unavailable, keeping window visible");
+                self.show_window(ctx);
+            }
+        }
+
         self.top_toolbar(ctx);
 
         let visible_count = self.filtered_history().len();
@@ -498,6 +747,8 @@ impl App for ClipboardDiaryApp {
                     .inner_margin(Margin::same(8)),
             )
             .show(ctx, |ui| self.history_ui(ui));
+
+        self.settings_window(ctx);
     }
 }
 
@@ -554,14 +805,22 @@ fn build_preview(content: &str) -> String {
     }
 }
 
-fn app_storage_path() -> PathBuf {
+fn app_data_dir() -> PathBuf {
     if let Some(project_dirs) = ProjectDirs::from("com", "ngthanhvu", "ClipboardDiary") {
         let base_dir = project_dirs.data_dir();
         let _ = fs::create_dir_all(base_dir);
-        return base_dir.join("clipboard-history.json");
+        return base_dir.to_path_buf();
     }
 
-    PathBuf::from("clipboard-history.json")
+    PathBuf::from(".")
+}
+
+fn app_storage_path() -> PathBuf {
+    app_data_dir().join("clipboard-history.json")
+}
+
+fn settings_path() -> PathBuf {
+    app_data_dir().join("settings.json")
 }
 
 fn load_history(path: &PathBuf) -> Vec<ClipboardEntry> {
@@ -575,6 +834,18 @@ fn save_history(path: &PathBuf, items: &[ClipboardEntry]) {
     if let Ok(json) = serde_json::to_string_pretty(items) {
         let _ = fs::write(path, json);
     }
+}
+
+fn load_settings(path: &PathBuf) -> AppSettings {
+    match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str::<AppSettings>(&content).unwrap_or_default(),
+        Err(_) => AppSettings::default(),
+    }
+}
+
+fn save_settings(path: &PathBuf, settings: &AppSettings) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
+    fs::write(path, json).map_err(|error| error.to_string())
 }
 
 fn read_clipboard_text() -> Result<String, String> {
@@ -638,6 +909,75 @@ fn truncate(value: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+fn parse_hotkey_setting(value: &str) -> Result<Option<HotKey>, String> {
+    let normalized = value.trim();
+    if normalized.is_empty() || normalized.eq_ignore_ascii_case("disabled") {
+        return Ok(None);
+    }
+
+    normalized
+        .parse::<HotKey>()
+        .map(Some)
+        .map_err(|error| format!("Invalid hotkey '{normalized}': {error}"))
+}
+
+fn apply_window_visibility(ctx: &Context, visible: bool) {
+    ctx.send_viewport_cmd(ViewportCommand::Visible(visible));
+    if visible {
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
+            egui::UserAttentionType::Informational,
+        ));
+    }
+}
+
+fn create_tray() -> Result<TrayHandles, String> {
+    let menu = Menu::new();
+    let show_hide = MenuItem::new("Show / Hide", true, None);
+    let settings = MenuItem::new("Settings", true, None);
+    let quit = MenuItem::new("Quit", true, None);
+
+    menu.append(&show_hide).map_err(|error| error.to_string())?;
+    menu.append(&settings).map_err(|error| error.to_string())?;
+    menu.append(&quit).map_err(|error| error.to_string())?;
+
+    let icon = Icon::from_rgba(build_tray_icon_rgba(), 16, 16).map_err(|error| error.to_string())?;
+    let tray = TrayIconBuilder::new()
+        .with_tooltip("Clipboard Diary")
+        .with_menu(Box::new(menu))
+        .with_icon(icon)
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    Ok(TrayHandles {
+        _tray: tray,
+        show_hide_id: show_hide.id().clone(),
+        settings_id: settings.id().clone(),
+        quit_id: quit.id().clone(),
+    })
+}
+
+fn build_tray_icon_rgba() -> Vec<u8> {
+    let mut rgba = vec![0_u8; 16 * 16 * 4];
+    for y in 0..16 {
+        for x in 0..16 {
+            let index = (y * 16 + x) * 4;
+            let inside = x > 1 && x < 14 && y > 1 && y < 14;
+            let accent = x > 3 && x < 12 && y > 3 && y < 12;
+            let color = if accent {
+                [23, 105, 214, 255]
+            } else if inside {
+                [242, 242, 242, 255]
+            } else {
+                [38, 38, 38, 255]
+            };
+            rgba[index..index + 4].copy_from_slice(&color);
+        }
+    }
+    rgba
 }
 
 pub fn run() -> eframe::Result {
