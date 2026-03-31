@@ -1,25 +1,18 @@
 [package]
 name = "rust"
 version = "0.1.0"
-description = "A Tauri App"
+description = "Clipboard history desktop app"
 authors = ["you"]
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "rust_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
+crate-type = ["rlib"]
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
+chrono = { version = "0.4", default-features = true, features = ["clock"] }
+directories = "5"
+eframe = "0.33.3"
+egui_extras = "0.33.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-

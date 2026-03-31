@@ -1,3 +1,13 @@
+use chrono::{Local, TimeZone};
+use directories::ProjectDirs;
+use eframe::{
+    egui::{
+        self, Align, Button, Color32, Context, Frame, Layout, Margin, RichText, ScrollArea,
+        Stroke, TextEdit, TopBottomPanel, Ui, Vec2,
+    },
+    App, CreationContext, NativeOptions,
+};
+use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -11,14 +21,11 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_HISTORY_ITEMS: usize = 250;
 const POLL_INTERVAL_MS: u64 = 900;
-const CLIPBOARD_EVENT: &str = "clipboard://updated";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ClipboardEntry {
     id: String,
     content: String,
@@ -28,43 +35,36 @@ struct ClipboardEntry {
     line_count: usize,
 }
 
-#[derive(Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClipboardSnapshot {
-    items: Vec<ClipboardEntry>,
-}
-
-struct AppState {
+struct HistoryStore {
     items: Mutex<Vec<ClipboardEntry>>,
     storage_path: PathBuf,
     monitor_started: AtomicBool,
 }
 
-impl AppState {
+impl HistoryStore {
     fn new(storage_path: PathBuf) -> Self {
-        let items = load_history(&storage_path);
         Self {
-            items: Mutex::new(items),
+            items: Mutex::new(load_history(&storage_path)),
             storage_path,
             monitor_started: AtomicBool::new(false),
         }
     }
 
-    fn get_items(&self) -> Vec<ClipboardEntry> {
+    fn history(&self) -> Vec<ClipboardEntry> {
         self.items
             .lock()
             .map(|items| items.clone())
             .unwrap_or_default()
     }
 
-    fn start_monitor(self: &Arc<Self>, app: AppHandle) {
+    fn start_monitor(self: &Arc<Self>, ctx: Context) {
         if self.monitor_started.swap(true, Ordering::SeqCst) {
             return;
         }
 
-        let state = Arc::clone(self);
+        let store = Arc::clone(self);
         thread::spawn(move || {
-            let mut last_clipboard = state
+            let mut last_clipboard = store
                 .items
                 .lock()
                 .ok()
@@ -72,22 +72,13 @@ impl AppState {
                 .unwrap_or_default();
 
             loop {
-                match read_clipboard_text() {
-                    Ok(content) => {
-                        if content.trim().is_empty() || content == last_clipboard {
-                            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-                            continue;
-                        }
-
-                        if let Some(entry) = state.record_content(content.clone()) {
+                if let Ok(content) = read_clipboard_text() {
+                    if !content.trim().is_empty() && content != last_clipboard {
+                        if store.record_content(content.clone()).is_some() {
                             last_clipboard = content;
-                            let payload = ClipboardSnapshot {
-                                items: vec![entry],
-                            };
-                            let _ = app.emit(CLIPBOARD_EVENT, payload);
+                            ctx.request_repaint();
                         }
                     }
-                    Err(_) => {}
                 }
 
                 thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
@@ -116,6 +107,18 @@ impl AppState {
         Some(entry)
     }
 
+    fn copy_entry(&self, id: &str) -> Result<(), String> {
+        let items = self.history();
+        let entry = items
+            .into_iter()
+            .find(|item| item.id == id)
+            .ok_or_else(|| String::from("Khong tim thay clip can copy"))?;
+
+        write_clipboard_text(&entry.content)?;
+        let _ = self.record_content(entry.content);
+        Ok(())
+    }
+
     fn delete_entry(&self, id: &str) -> Result<(), String> {
         let mut items = self
             .items
@@ -139,6 +142,390 @@ impl AppState {
         save_history(&self.storage_path, &items);
         Ok(())
     }
+}
+
+struct ClipboardDiaryApp {
+    store: Arc<HistoryStore>,
+    search: String,
+    selected_id: Option<String>,
+    status_message: String,
+}
+
+impl ClipboardDiaryApp {
+    fn new(cc: &CreationContext<'_>) -> Self {
+        configure_visuals(&cc.egui_ctx);
+
+        let storage_path = app_storage_path();
+        let store = Arc::new(HistoryStore::new(storage_path));
+        store.start_monitor(cc.egui_ctx.clone());
+
+        let selected_id = store.history().first().map(|entry| entry.id.clone());
+        Self {
+            store,
+            search: String::new(),
+            selected_id,
+            status_message: String::from("Ready"),
+        }
+    }
+
+    fn filtered_history(&self) -> Vec<ClipboardEntry> {
+        let items = self.store.history();
+        let keyword = self.search.trim().to_lowercase();
+        if keyword.is_empty() {
+            return items;
+        }
+
+        items.into_iter()
+            .filter(|entry| {
+                let haystack = format!("{}\n{}", entry.preview, entry.content).to_lowercase();
+                haystack.contains(&keyword)
+            })
+            .collect()
+    }
+
+    fn selected_entry<'a>(&self, items: &'a [ClipboardEntry]) -> Option<&'a ClipboardEntry> {
+        self.selected_id
+            .as_ref()
+            .and_then(|id| items.iter().find(|item| item.id == *id))
+            .or_else(|| items.first())
+    }
+
+    fn ensure_selection(&mut self, items: &[ClipboardEntry]) {
+        let exists = self
+            .selected_id
+            .as_ref()
+            .map(|id| items.iter().any(|item| item.id == *id))
+            .unwrap_or(false);
+
+        if !exists {
+            self.selected_id = items.first().map(|item| item.id.clone());
+        }
+    }
+
+    fn copy_selected(&mut self, items: &[ClipboardEntry]) {
+        if let Some(entry) = self.selected_entry(items) {
+            match self.store.copy_entry(&entry.id) {
+                Ok(()) => {
+                    self.status_message =
+                        format!("Copied '{}' back to clipboard", truncate(&entry.preview, 36));
+                }
+                Err(error) => self.status_message = error,
+            }
+        }
+    }
+
+    fn delete_selected(&mut self, items: &[ClipboardEntry]) {
+        if let Some(entry) = self.selected_entry(items) {
+            let entry_id = entry.id.clone();
+            match self.store.delete_entry(&entry_id) {
+                Ok(()) => {
+                    self.status_message = String::from("Deleted selected clip");
+                    self.selected_id = None;
+                }
+                Err(error) => self.status_message = error,
+            }
+        }
+    }
+
+    fn clear_history(&mut self) {
+        match self.store.clear() {
+            Ok(()) => {
+                self.selected_id = None;
+                self.status_message = String::from("Cleared clipboard history");
+            }
+            Err(error) => self.status_message = error,
+        }
+    }
+
+    fn top_toolbar(&mut self, ctx: &Context) {
+        TopBottomPanel::top("toolbar")
+            .exact_height(38.0)
+            .frame(
+                Frame::new()
+                    .fill(Color32::from_rgb(236, 236, 236))
+                    .inner_margin(Margin::symmetric(6, 4)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.add(Button::new("Copy")).clicked() {
+                        let items = self.filtered_history();
+                        self.copy_selected(&items);
+                    }
+                    if ui.add(Button::new("Delete")).clicked() {
+                        let items = self.filtered_history();
+                        self.delete_selected(&items);
+                    }
+                    if ui.add(Button::new("Clear all")).clicked() {
+                        self.clear_history();
+                    }
+                    ui.separator();
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("Clipboard history")
+                            .strong()
+                            .color(Color32::from_rgb(38, 38, 38)),
+                    );
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let available = ui.available_width();
+                        if available > 150.0 {
+                            ui.label(
+                                RichText::new("Double click a row to copy")
+                                    .color(Color32::from_rgb(90, 90, 90)),
+                            );
+                        }
+                    });
+                });
+            });
+    }
+
+    fn bottom_bar(&mut self, ctx: &Context, visible_count: usize, total_count: usize) {
+        TopBottomPanel::bottom("status_bar")
+            .frame(
+                Frame::new()
+                    .fill(Color32::from_rgb(240, 240, 240))
+                    .inner_margin(Margin::symmetric(8, 6)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [140.0, 22.0],
+                        TextEdit::singleline(&mut self.search).hint_text("Search clips..."),
+                    );
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("{visible_count}/{total_count} clips"))
+                            .color(Color32::from_rgb(50, 50, 50)),
+                    );
+                    ui.separator();
+                    ui.label(
+                        RichText::new(&self.status_message).color(Color32::from_rgb(55, 55, 55)),
+                    );
+                });
+            });
+    }
+
+    fn history_ui(&mut self, ui: &mut Ui) {
+        let items = self.filtered_history();
+        let total_items = self.store.history().len();
+        self.ensure_selection(&items);
+        let selected_id = self.selected_entry(&items).map(|entry| entry.id.clone());
+        let compact = ui.available_width() < 520.0;
+
+        ui.vertical(|ui| {
+            Frame::group(ui.style())
+                .inner_margin(Margin::same(6))
+                .show(ui, |ui| {
+                    let mut table = TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(false)
+                        .cell_layout(Layout::left_to_right(Align::Center))
+                        .column(Column::exact(24.0))
+                        .column(Column::remainder());
+
+                    if !compact {
+                        table = table.column(Column::exact(92.0));
+                    }
+
+                    table.header(20.0, |mut header| {
+                            header.col(|ui| {
+                                ui.label(RichText::new("#").strong().color(Color32::from_rgb(48, 48, 48)));
+                            });
+                            header.col(|ui| {
+                                ui.label(
+                                    RichText::new("Clipboard history")
+                                        .strong()
+                                        .color(Color32::from_rgb(48, 48, 48)),
+                                );
+                            });
+                            if !compact {
+                                header.col(|ui| {
+                                    ui.label(
+                                        RichText::new("Captured")
+                                            .strong()
+                                            .color(Color32::from_rgb(48, 48, 48)),
+                                    );
+                                });
+                            }
+                        })
+                        .body(|body| {
+                            body.rows(22.0, items.len(), |mut row| {
+                                let index = row.index();
+                                let entry = &items[index];
+                                let is_selected = selected_id
+                                    .as_ref()
+                                    .map(|current| current == &entry.id)
+                                    .unwrap_or(false);
+
+                                row.col(|ui| {
+                                    let icon = if entry.line_count > 1 { "S" } else { "T" };
+                                    let text = if is_selected {
+                                        RichText::new(icon).strong().color(Color32::WHITE)
+                                    } else {
+                                        RichText::new(icon).strong().color(Color32::from_rgb(0, 70, 160))
+                                    };
+                                    ui.label(text);
+                                });
+
+                                row.col(|ui| {
+                                    let preview_text = if compact {
+                                        truncate(&entry.preview, 40)
+                                    } else {
+                                        truncate(&entry.preview, 86)
+                                    };
+                                    let response = ui
+                                        .allocate_ui_with_layout(
+                                            Vec2::new(ui.available_width(), 18.0),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| ui.selectable_label(is_selected, preview_text),
+                                        )
+                                        .inner
+                                        .on_hover_text(&entry.preview);
+                                    if response.clicked() {
+                                        self.selected_id = Some(entry.id.clone());
+                                    }
+                                    if response.double_clicked() {
+                                        match self.store.copy_entry(&entry.id) {
+                                            Ok(()) => {
+                                                self.status_message = format!(
+                                                    "Copied '{}' back to clipboard",
+                                                    truncate(&entry.preview, 36)
+                                                );
+                                            }
+                                            Err(error) => self.status_message = error,
+                                        }
+                                    }
+                                    response.context_menu(|ui| {
+                                        if ui.button("Copy to clipboard").clicked() {
+                                            let _ = self.store.copy_entry(&entry.id);
+                                            self.status_message = String::from("Copied selected clip");
+                                            ui.close();
+                                        }
+                                        if ui.button("Delete").clicked() {
+                                            let _ = self.store.delete_entry(&entry.id);
+                                            self.status_message = String::from("Deleted selected clip");
+                                            self.selected_id = None;
+                                            ui.close();
+                                        }
+                                    });
+                                });
+
+                                if !compact {
+                                    row.col(|ui| {
+                                        let color = if is_selected {
+                                            Color32::WHITE
+                                        } else {
+                                            Color32::from_gray(90)
+                                        };
+                                        ui.label(
+                                            RichText::new(format_timestamp(entry.created_at)).color(color),
+                                        );
+                                    });
+                                }
+                            });
+                        });
+                });
+
+            ui.add_space(6.0);
+            Frame::group(ui.style())
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new("Preview")
+                                .strong()
+                                .color(Color32::from_rgb(45, 45, 45)),
+                        );
+                        ui.separator();
+                        if let Some(entry) = self.selected_entry(&items) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} chars | {} lines",
+                                    entry.character_count, entry.line_count
+                                ))
+                                .color(Color32::from_rgb(60, 60, 60)),
+                            );
+                            ui.separator();
+                            if ui.button("Copy").clicked() {
+                                self.copy_selected(&items);
+                            }
+                            if ui.button("Delete").clicked() {
+                                self.delete_selected(&items);
+                            }
+                        } else {
+                            ui.label("No clip selected");
+                        }
+                    });
+                    ui.separator();
+
+                    let preview_height = (ui.available_height() - 6.0).max(120.0);
+                    ScrollArea::vertical()
+                        .max_height(preview_height)
+                        .show(ui, |ui| {
+                            if let Some(entry) = self.selected_entry(&items) {
+                                let mut preview_text = entry.content.clone();
+                                ui.add_sized(
+                                    [ui.available_width(), preview_height],
+                                    TextEdit::multiline(&mut preview_text)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .interactive(false),
+                                );
+                            } else if total_items == 0 {
+                                ui.label("Clipboard history is empty. Copy any text in Windows to start.");
+                            } else {
+                                ui.label("No clip matches the current search.");
+                            }
+                        });
+                });
+        });
+    }
+
+}
+
+impl App for ClipboardDiaryApp {
+    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.top_toolbar(ctx);
+
+        let visible_count = self.filtered_history().len();
+        let total_count = self.store.history().len();
+        self.bottom_bar(ctx, visible_count, total_count);
+
+        egui::CentralPanel::default()
+            .frame(
+                Frame::new()
+                    .fill(Color32::from_rgb(230, 230, 230))
+                    .inner_margin(Margin::same(8)),
+            )
+            .show(ctx, |ui| self.history_ui(ui));
+    }
+}
+
+fn configure_visuals(ctx: &Context) {
+    let mut visuals = egui::Visuals::light();
+    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(236, 236, 236);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(68, 68, 68));
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(248, 248, 248);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(44, 44, 44));
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(255, 255, 255);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(24, 24, 24));
+    visuals.widgets.active.bg_fill = Color32::from_rgb(12, 104, 204);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.open.bg_fill = Color32::from_rgb(242, 242, 242);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(32, 32, 32));
+    visuals.selection.bg_fill = Color32::from_rgb(12, 104, 204);
+    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.extreme_bg_color = Color32::WHITE;
+    visuals.panel_fill = Color32::from_rgb(230, 230, 230);
+    visuals.window_fill = Color32::from_rgb(236, 236, 236);
+    visuals.window_stroke = Stroke::new(1.0, Color32::from_gray(160));
+    visuals.override_text_color = Some(Color32::from_rgb(32, 32, 32));
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = Vec2::new(6.0, 4.0);
+    style.spacing.button_padding = Vec2::new(8.0, 3.0);
+    ctx.set_style(style);
 }
 
 fn build_entry(content: String) -> ClipboardEntry {
@@ -167,20 +554,14 @@ fn build_preview(content: &str) -> String {
     }
 }
 
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+fn app_storage_path() -> PathBuf {
+    if let Some(project_dirs) = ProjectDirs::from("com", "ngthanhvu", "ClipboardDiary") {
+        let base_dir = project_dirs.data_dir();
+        let _ = fs::create_dir_all(base_dir);
+        return base_dir.join("clipboard-history.json");
+    }
 
-fn app_storage_path(app: &AppHandle) -> PathBuf {
-    let base_dir = app
-        .path()
-        .app_data_dir()
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let _ = fs::create_dir_all(&base_dir);
-    base_dir.join("clipboard-history.json")
+    PathBuf::from("clipboard-history.json")
 }
 
 fn load_history(path: &PathBuf) -> Vec<ClipboardEntry> {
@@ -235,51 +616,42 @@ fn write_clipboard_text(content: &str) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-fn get_history(state: State<'_, Arc<AppState>>) -> Vec<ClipboardEntry> {
-    state.get_items()
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
-#[tauri::command]
-fn copy_entry(id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let items = state.get_items();
-    let entry = items
-        .into_iter()
-        .find(|item| item.id == id)
-        .ok_or_else(|| String::from("Khong tim thay muc clipboard"))?;
-
-    write_clipboard_text(&entry.content)?;
-    let _ = state.record_content(entry.content);
-    Ok(())
+fn format_timestamp(timestamp: u64) -> String {
+    match Local.timestamp_millis_opt(timestamp as i64).single() {
+        Some(date_time) => date_time.format("%H:%M:%S %d-%m").to_string(),
+        None => String::from("--:--:--"),
+    }
 }
 
-#[tauri::command]
-fn delete_entry(id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.delete_entry(&id)
+fn truncate(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
-#[tauri::command]
-fn clear_history(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.clear()
-}
+pub fn run() -> eframe::Result {
+    let native_options = NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Clipdiary (Clipboard history : All clips)")
+            .with_inner_size([460.0, 680.0])
+            .with_min_inner_size([400.0, 500.0]),
+        ..Default::default()
+    };
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .setup(|app| {
-            let storage_path = app_storage_path(&app.handle().clone());
-            let state = Arc::new(AppState::new(storage_path));
-            state.start_monitor(app.handle().clone());
-            app.manage(state);
-            Ok(())
-        })
-        .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![
-            get_history,
-            copy_entry,
-            delete_entry,
-            clear_history
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    eframe::run_native(
+        "Clipboard Diary",
+        native_options,
+        Box::new(|cc| Ok(Box::new(ClipboardDiaryApp::new(cc)))),
+    )
 }
