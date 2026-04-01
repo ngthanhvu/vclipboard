@@ -2,9 +2,10 @@ use arboard::Clipboard;
 use chrono::{Local, TimeZone};
 use directories::ProjectDirs;
 use eframe::{
+    icon_data::from_png_bytes,
     egui::{
-        self, Align, Align2, Button, Color32, Context, Frame, Layout, Margin, RichText, Stroke,
-        TextEdit, TopBottomPanel, Ui, Vec2, ViewportCommand,
+        self, Align, Align2, Button, Color32, Context, Frame, IconData, Layout, Margin,
+        RichText, Stroke, TextEdit, TopBottomPanel, Ui, Vec2, ViewportCommand,
     },
     App, CreationContext, NativeOptions,
 };
@@ -961,7 +962,9 @@ fn create_tray() -> Result<TrayHandles, String> {
     menu.append(&settings).map_err(|error| error.to_string())?;
     menu.append(&quit).map_err(|error| error.to_string())?;
 
-    let icon = Icon::from_rgba(build_tray_icon_rgba(), 16, 16).map_err(|error| error.to_string())?;
+    let tray_icon = load_tray_icon()?;
+    let icon = Icon::from_rgba(tray_icon.rgba, tray_icon.width, tray_icon.height)
+        .map_err(|error| error.to_string())?;
     let tray = TrayIconBuilder::new()
         .with_tooltip("Clipboard Diary")
         .with_menu(Box::new(menu))
@@ -1086,33 +1089,33 @@ fn should_toggle_now(last_toggle: &Mutex<Option<Instant>>) -> bool {
     true
 }
 
-fn build_tray_icon_rgba() -> Vec<u8> {
-    let mut rgba = vec![0_u8; 16 * 16 * 4];
-    for y in 0..16 {
-        for x in 0..16 {
-            let index = (y * 16 + x) * 4;
-            let inside = x > 1 && x < 14 && y > 1 && y < 14;
-            let accent = x > 3 && x < 12 && y > 3 && y < 12;
-            let color = if accent {
-                [23, 105, 214, 255]
-            } else if inside {
-                [242, 242, 242, 255]
-            } else {
-                [38, 38, 38, 255]
-            };
-            rgba[index..index + 4].copy_from_slice(&color);
-        }
-    }
-    rgba
+fn load_tray_icon() -> Result<IconData, String> {
+    from_png_bytes(include_bytes!("../../assets/16x16.png")).map_err(|error| error.to_string())
+}
+
+fn load_window_icon() -> Result<IconData, String> {
+    from_png_bytes(include_bytes!("../../assets/256x256.png")).map_err(|error| error.to_string())
 }
 
 pub fn run() -> eframe::Result {
-    append_log("app run start");
-    let native_options = NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    let viewport = {
+        let builder = egui::ViewportBuilder::default()
             .with_title("Clipdiary (Clipboard history : All clips)")
             .with_inner_size([460.0, 680.0])
-            .with_min_inner_size([400.0, 500.0]),
+            .with_min_inner_size([400.0, 500.0]);
+
+        match load_window_icon() {
+            Ok(icon) => builder.with_icon(icon),
+            Err(error) => {
+                append_log(format!("window icon load failed: {error}"));
+                builder
+            }
+        }
+    };
+
+    append_log("app run start");
+    let native_options = NativeOptions {
+        viewport,
         ..Default::default()
     };
 
