@@ -677,21 +677,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clipboard_diary"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "chrono",
- "directories",
- "eframe",
- "egui_extras",
- "global-hotkey",
- "serde",
- "serde_json",
- "tray-icon",
-]
-
-[[package]]
 name = "codespan-reporting"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3893,6 +3878,21 @@ dependencies = [
  "js-sys",
  "serde_core",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "vclipboard"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "chrono",
+ "directories",
+ "eframe",
+ "egui_extras",
+ "global-hotkey",
+ "serde",
+ "serde_json",
+ "tray-icon",
 ]
 
 [[package]]

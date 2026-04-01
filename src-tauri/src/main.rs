@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    clipboard_diary_lib::run().expect("failed to launch Clipboard Diary");
+    vclipboard_lib::run().expect("failed to launch Vclipboard");
 }

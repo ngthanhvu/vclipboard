@@ -1,16 +1,16 @@
 [package]
-name = "clipboard_diary"
+name = "vclipboard"
 version = "0.1.0"
 description = "Clipboard history desktop app"
 authors = ["you"]
 edition = "2021"
 
 [lib]
-name = "clipboard_diary_lib"
+name = "vclipboard_lib"
 crate-type = ["rlib"]
 
 [[bin]]
-name = "ClipboardDiary"
+name = "Vclipboard"
 path = "src/main.rs"
 
 [dependencies]
