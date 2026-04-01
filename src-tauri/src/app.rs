@@ -1,7 +1,7 @@
 use eframe::{
     egui::{
-        self, Align, Align2, Button, Color32, Context, Frame, Layout, Margin, RichText, Stroke,
-        TextEdit, TopBottomPanel, Ui, Vec2, ViewportCommand,
+        self, Align, Align2, Button, Color32, Context, Frame, Key, Layout, Margin, RichText,
+        Sense, Stroke, TextEdit, TopBottomPanel, Ui, Vec2, ViewportCommand,
     },
     App, CreationContext,
 };
@@ -14,8 +14,8 @@ use std::sync::{
 
 use crate::{
     platform::{
-        apply_window_visibility, create_tray, parse_hotkey_setting, record_hotkey_from_input,
-        spawn_external_event_forwarders,
+        apply_window_visibility, capture_native_window_handle, create_tray,
+        parse_hotkey_setting, record_hotkey_from_input, spawn_external_event_forwarders,
     },
     storage::{
         app_storage_path, append_log, format_timestamp, load_settings, save_settings,
@@ -66,6 +66,9 @@ impl ClipboardDiaryApp {
         let startup_hide_pending = false;
         let runtime_shared = Arc::new(RuntimeShared {
             window_visible: AtomicBool::new(true),
+            native_hwnd: std::sync::atomic::AtomicIsize::new(
+                capture_native_window_handle(cc).unwrap_or(0),
+            ),
             hotkey_id: AtomicU32::new(0),
             open_settings: AtomicBool::new(false),
             last_hotkey_toggle: Mutex::new(None),
@@ -190,13 +193,28 @@ impl ClipboardDiaryApp {
         }
     }
 
+    fn handle_shortcuts(&mut self, ctx: &Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
+        let copy_pressed = ctx.input(|input| {
+            (input.modifiers.ctrl || input.modifiers.command) && input.key_pressed(Key::C)
+        });
+
+        if copy_pressed {
+            let items = self.filtered_history();
+            self.copy_selected(&items);
+        }
+    }
+
     fn show_window(&mut self, ctx: &Context) {
         append_log("show_window");
         self.window_visible = true;
         self.runtime_shared
             .window_visible
             .store(true, Ordering::SeqCst);
-        apply_window_visibility(ctx, true);
+        apply_window_visibility(ctx, &self.runtime_shared, true);
         self.status_message = String::from("Vclipboard shown");
     }
 
@@ -216,7 +234,7 @@ impl ClipboardDiaryApp {
         self.runtime_shared
             .window_visible
             .store(false, Ordering::SeqCst);
-        apply_window_visibility(ctx, false);
+        apply_window_visibility(ctx, &self.runtime_shared, false);
         self.status_message = String::from("Vclipboard hidden to tray");
     }
 
@@ -475,8 +493,9 @@ impl ClipboardDiaryApp {
                 let mut table = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(false)
-                    .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(Column::exact(24.0))
+                    // Căn trái toàn bộ cell trong bảng
+                    .cell_layout(Layout::left_to_right(Align::Min))
+                    .column(Column::exact(18.0))
                     .column(Column::remainder());
 
                 if !compact {
@@ -486,21 +505,34 @@ impl ClipboardDiaryApp {
                 table
                     .header(20.0, |mut header| {
                         header.col(|ui| {
-                            ui.label(RichText::new("#").strong().color(Color32::from_rgb(48, 48, 48)));
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new("#")
+                                        .strong()
+                                        .color(Color32::from_rgb(48, 48, 48)),
+                                )
+                                .halign(Align::Min),
+                            );
                         });
                         header.col(|ui| {
-                            ui.label(
-                                RichText::new("Clipboard history")
-                                    .strong()
-                                    .color(Color32::from_rgb(48, 48, 48)),
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new("Clipboard history")
+                                        .strong()
+                                        .color(Color32::from_rgb(48, 48, 48)),
+                                )
+                                .halign(Align::Min),
                             );
                         });
                         if !compact {
                             header.col(|ui| {
-                                ui.label(
-                                    RichText::new("Captured")
-                                        .strong()
-                                        .color(Color32::from_rgb(48, 48, 48)),
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new("Captured")
+                                            .strong()
+                                            .color(Color32::from_rgb(48, 48, 48)),
+                                    )
+                                    .halign(Align::Min),
                                 );
                             });
                         }
@@ -513,16 +545,34 @@ impl ClipboardDiaryApp {
                                 .as_ref()
                                 .map(|current| current == &entry.id)
                                 .unwrap_or(false);
+                            row.set_selected(is_selected);
 
+                            // Cột icon
                             row.col(|ui| {
                                 let icon = if entry.line_count > 1 { "S" } else { "T" };
                                 let text = RichText::new(icon)
                                     .strong()
-                                    .color(Color32::from_rgb(0, 70, 160));
-                                ui.label(text);
+                                    .color(if is_selected {
+                                        Color32::from_rgb(205, 225, 255)
+                                    } else {
+                                        Color32::from_rgb(0, 70, 160)
+                                    });
+                                let response = ui
+                                    .add(
+                                        egui::Label::new(text)
+                                            .halign(Align::Min)
+                                            .sense(Sense::click())
+                                            .selectable(false),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if response.clicked() {
+                                    self.selected_id = Some(entry.id.clone());
+                                }
                             });
 
+                            // Cột preview (nội dung chính)
                             row.col(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
                                 let preview_text = if compact {
                                     truncate(&entry.preview, 40)
                                 } else {
@@ -533,14 +583,24 @@ impl ClipboardDiaryApp {
                                 } else {
                                     Color32::from_rgb(38, 38, 38)
                                 });
+
                                 let response = ui
                                     .allocate_ui_with_layout(
                                         Vec2::new(ui.available_width(), 18.0),
                                         Layout::left_to_right(Align::Center),
-                                        |ui| ui.selectable_label(is_selected, row_text),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(row_text)
+                                                    .truncate()
+                                                    .halign(Align::Min)
+                                                    .selectable(false)
+                                                    .sense(Sense::click()),
+                                            )
+                                        },
                                     )
                                     .inner
-                                    .on_hover_text(&entry.preview);
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+
                                 if response.clicked() {
                                     self.selected_id = Some(entry.id.clone());
                                 }
@@ -555,7 +615,7 @@ impl ClipboardDiaryApp {
                                         Err(error) => self.status_message = error,
                                     }
                                 }
-                                response.context_menu(|ui| {
+                                response.clone().context_menu(|ui| {
                                     if ui.button("Copy to clipboard").clicked() {
                                         let _ = self.store.copy_entry(&entry.id);
                                         self.status_message = String::from("Copied selected clip");
@@ -570,6 +630,7 @@ impl ClipboardDiaryApp {
                                 });
                             });
 
+                            // Cột thời gian
                             if !compact {
                                 row.col(|ui| {
                                     let color = if is_selected {
@@ -577,11 +638,16 @@ impl ClipboardDiaryApp {
                                     } else {
                                         Color32::from_gray(90)
                                     };
-                                    ui.label(
-                                        RichText::new(format_timestamp(entry.created_at)).color(color),
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format_timestamp(entry.created_at)).color(color),
+                                        )
+                                        .halign(Align::Min),
                                     );
                                 });
                             }
+
+                            let _ = row.response().on_hover_text(&entry.preview);
                         });
                     });
 
@@ -596,6 +662,7 @@ impl ClipboardDiaryApp {
 impl App for ClipboardDiaryApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.sync_runtime_requests();
+        self.handle_shortcuts(ctx);
 
         if self.startup_hide_pending {
             append_log("startup_hide_pending fired");
@@ -667,3 +734,4 @@ fn configure_visuals(ctx: &Context) {
     style.spacing.button_padding = Vec2::new(8.0, 3.0);
     ctx.set_style(style);
 }
+

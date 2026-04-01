@@ -1,8 +1,10 @@
 use eframe::{
     icon_data::from_png_bytes,
     egui::{self, Context, IconData, ViewportCommand},
+    CreationContext,
 };
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
     sync::{
         atomic::Ordering,
@@ -19,6 +21,12 @@ use tray_icon::{
 use crate::{
     storage::append_log,
     types::{RuntimeShared, TrayHandles},
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GWL_EXSTYLE, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 pub(crate) fn parse_hotkey_setting(value: &str) -> Result<Option<HotKey>, String> {
@@ -141,8 +149,17 @@ fn format_egui_key(key: egui::Key) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn apply_window_visibility(ctx: &Context, visible: bool) {
+pub(crate) fn capture_native_window_handle(cc: &CreationContext<'_>) -> Option<isize> {
+    let handle = cc.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(window) => Some(window.hwnd.get()),
+        _ => None,
+    }
+}
+
+pub(crate) fn apply_window_visibility(ctx: &Context, shared: &RuntimeShared, visible: bool) {
     append_log(format!("apply_window_visibility visible={visible}"));
+    apply_native_window_visibility(shared, visible);
     if visible {
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
@@ -150,10 +167,52 @@ pub(crate) fn apply_window_visibility(ctx: &Context, visible: bool) {
         ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
             egui::UserAttentionType::Informational,
         ));
-    } else {
-        ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
     }
 }
+
+#[cfg(target_os = "windows")]
+fn apply_native_window_visibility(shared: &RuntimeShared, visible: bool) {
+    let hwnd = shared.native_hwnd.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+
+    unsafe {
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let mut next_style = ex_style;
+        if visible {
+            next_style |= WS_EX_APPWINDOW;
+            next_style &= !WS_EX_TOOLWINDOW;
+        } else {
+            next_style |= WS_EX_TOOLWINDOW;
+            next_style &= !WS_EX_APPWINDOW;
+        }
+
+        if next_style != ex_style {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next_style as isize);
+            SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+
+        if visible {
+            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        } else {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_native_window_visibility(_shared: &RuntimeShared, _visible: bool) {}
 
 pub(crate) fn create_tray() -> Result<TrayHandles, String> {
     append_log("create_tray start");
@@ -207,7 +266,7 @@ pub(crate) fn spawn_external_event_forwarders(
                         menu_shared
                             .window_visible
                             .store(next_visible, Ordering::SeqCst);
-                        apply_window_visibility(&menu_ctx, next_visible);
+                        apply_window_visibility(&menu_ctx, &menu_shared, next_visible);
                     } else {
                         append_log("tray menu toggle ignored (debounced)");
                     }
@@ -215,7 +274,7 @@ pub(crate) fn spawn_external_event_forwarders(
                     menu_shared.window_visible.store(true, Ordering::SeqCst);
                     menu_shared.open_settings.store(true, Ordering::SeqCst);
                     append_log("tray menu settings -> visible=true");
-                    apply_window_visibility(&menu_ctx, true);
+                    apply_window_visibility(&menu_ctx, &menu_shared, true);
                 } else if event.id == quit_id {
                     append_log("tray menu quit");
                     menu_ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -241,7 +300,7 @@ pub(crate) fn spawn_external_event_forwarders(
                         click_shared
                             .window_visible
                             .store(next_visible, Ordering::SeqCst);
-                        apply_window_visibility(&click_ctx, next_visible);
+                        apply_window_visibility(&click_ctx, &click_shared, next_visible);
                         click_ctx.request_repaint();
                     } else {
                         append_log("tray double click ignored (debounced)");
@@ -264,7 +323,7 @@ pub(crate) fn spawn_external_event_forwarders(
                         let next_visible = !currently_visible;
                         append_log(format!("hotkey toggle -> visible={next_visible}"));
                         shared.window_visible.store(next_visible, Ordering::SeqCst);
-                        apply_window_visibility(&ctx, next_visible);
+                        apply_window_visibility(&ctx, &shared, next_visible);
                         ctx.request_repaint();
                     } else {
                         append_log("hotkey toggle ignored (debounced)");

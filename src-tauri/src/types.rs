@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -52,6 +52,7 @@ pub(crate) struct TrayHandles {
 
 pub(crate) struct RuntimeShared {
     pub(crate) window_visible: AtomicBool,
+    pub(crate) native_hwnd: AtomicIsize,
     pub(crate) hotkey_id: AtomicU32,
     pub(crate) open_settings: AtomicBool,
     pub(crate) last_hotkey_toggle: Mutex<Option<Instant>>,

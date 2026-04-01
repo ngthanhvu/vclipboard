@@ -3890,9 +3890,11 @@ dependencies = [
  "eframe",
  "egui_extras",
  "global-hotkey",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tray-icon",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
