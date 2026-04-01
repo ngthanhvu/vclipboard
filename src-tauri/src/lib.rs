@@ -1,3 +1,4 @@
+use arboard::Clipboard;
 use chrono::{Local, TimeZone};
 use directories::ProjectDirs;
 use eframe::{
@@ -17,13 +18,12 @@ use std::{
     fs,
     io::Write,
     path::PathBuf,
-    process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem},
@@ -63,6 +63,14 @@ struct TrayHandles {
     show_hide_id: MenuId,
     settings_id: MenuId,
     quit_id: MenuId,
+}
+
+struct RuntimeShared {
+    window_visible: AtomicBool,
+    hotkey_id: AtomicU32,
+    open_settings: AtomicBool,
+    last_hotkey_toggle: Mutex<Option<Instant>>,
+    last_tray_toggle: Mutex<Option<Instant>>,
 }
 
 struct HistoryStore {
@@ -192,6 +200,7 @@ struct ClipboardDiaryApp {
     start_hidden_effective: bool,
     settings_hotkey_input: String,
     settings_start_hidden: bool,
+    runtime_shared: Arc<RuntimeShared>,
 }
 
 impl ClipboardDiaryApp {
@@ -211,13 +220,27 @@ impl ClipboardDiaryApp {
         let settings_start_hidden = settings.start_hidden_in_tray;
         let startup_hidden = settings.start_hidden_in_tray;
         let tray_available = tray.is_some();
-        let startup_hide_pending = startup_hidden && tray_available;
+        let startup_hide_pending = false;
+        let runtime_shared = Arc::new(RuntimeShared {
+            window_visible: AtomicBool::new(true),
+            hotkey_id: AtomicU32::new(0),
+            open_settings: AtomicBool::new(false),
+            last_hotkey_toggle: Mutex::new(None),
+            last_tray_toggle: Mutex::new(None),
+        });
+        if let Some(tray_handles) = tray.as_ref() {
+            spawn_external_event_forwarders(
+                cc.egui_ctx.clone(),
+                Arc::clone(&runtime_shared),
+                tray_handles.show_hide_id.clone(),
+                tray_handles.settings_id.clone(),
+                tray_handles.quit_id.clone(),
+            );
+        }
         let initial_status = if let Some(error) = tray_error.as_ref() {
             format!("Tray icon unavailable, starting visible: {error}")
-        } else if startup_hide_pending {
-            String::from("Tray icon ready, startup hide armed")
         } else if startup_hidden {
-            String::from("Start hidden requested, but skipped for safety")
+            String::from("Start hidden is enabled, but this launch starts visible for safety")
         } else {
             String::from("Ready")
         };
@@ -238,16 +261,18 @@ impl ClipboardDiaryApp {
             quit_requested: false,
             startup_hide_pending,
             start_hidden_requested: startup_hidden,
-            start_hidden_effective: startup_hide_pending,
+            start_hidden_effective: startup_hidden && tray_available,
             settings_hotkey_input,
             settings_start_hidden,
+            runtime_shared,
         };
         app.apply_hotkey_setting();
         if app.tray.is_none() {
             app.status_message =
                 String::from("Tray icon unavailable, starting visible for safety");
-        } else if app.start_hidden_requested && !app.start_hidden_effective {
-            app.status_message = String::from("Start hidden skipped for safety");
+        } else if app.start_hidden_requested {
+            app.status_message =
+                String::from("Start hidden is enabled, but this launch starts visible for safety");
         }
         app
     }
@@ -321,36 +346,39 @@ impl ClipboardDiaryApp {
         }
     }
 
-    fn toggle_visibility(&mut self, ctx: &Context) {
-        self.window_visible = !self.window_visible;
-        if self.window_visible {
-            apply_window_visibility(ctx, true);
-            self.status_message = String::from("Clipboard Diary shown");
-        } else {
-            self.hide_window(ctx);
-        }
-    }
-
     fn show_window(&mut self, ctx: &Context) {
+        append_log("show_window");
         self.window_visible = true;
+        self.runtime_shared
+            .window_visible
+            .store(true, Ordering::SeqCst);
         apply_window_visibility(ctx, true);
         self.status_message = String::from("Clipboard Diary shown");
     }
 
     fn hide_window(&mut self, ctx: &Context) {
         if self.tray.is_none() {
+            append_log("hide_window blocked: tray unavailable");
             self.window_visible = true;
+            self.runtime_shared
+                .window_visible
+                .store(true, Ordering::SeqCst);
             self.status_message =
                 String::from("Tray icon unavailable, cannot hide window to tray");
             return;
         }
+        append_log("hide_window to tray");
         self.window_visible = false;
+        self.runtime_shared
+            .window_visible
+            .store(false, Ordering::SeqCst);
         apply_window_visibility(ctx, false);
         self.status_message = String::from("Clipboard Diary hidden to tray");
     }
 
     fn apply_hotkey_setting(&mut self) {
         let Some(manager) = self.hotkey_manager.as_ref() else {
+            append_log("apply_hotkey_setting: manager unavailable");
             self.status_message = String::from("Global hotkey is not available on this system");
             if self.start_hidden_requested {
                 self.start_hidden_effective = false;
@@ -366,14 +394,23 @@ impl ClipboardDiaryApp {
         match parse_hotkey_setting(&self.settings.hotkey) {
             Ok(Some(hotkey)) => match manager.register(hotkey.clone()) {
                 Ok(()) => {
+                    append_log(format!("hotkey registered: {}", self.settings.hotkey));
                     self.registered_hotkey = Some(hotkey);
+                    self.runtime_shared
+                        .hotkey_id
+                        .store(self.registered_hotkey.as_ref().map(|h| h.id()).unwrap_or(0), Ordering::SeqCst);
                     let _ = save_settings(&settings_path(), &self.settings);
                     self.status_message =
                         format!("Hotkey set to {}", self.settings.hotkey.as_str());
                 }
                 Err(error) => {
+                    append_log(format!(
+                        "hotkey register failed: {} | {}",
+                        self.settings.hotkey, error
+                    ));
                     self.start_hidden_effective = false;
                     self.startup_hide_pending = false;
+                    self.runtime_shared.hotkey_id.store(0, Ordering::SeqCst);
                     self.status_message =
                         format!(
                             "Could not register hotkey '{}': {error}. Starting visible for safety",
@@ -382,49 +419,31 @@ impl ClipboardDiaryApp {
                 }
             },
             Ok(None) => {
+                append_log("hotkey disabled");
+                self.runtime_shared.hotkey_id.store(0, Ordering::SeqCst);
                 let _ = save_settings(&settings_path(), &self.settings);
                 self.status_message = String::from("Global hotkey disabled");
             }
             Err(error) => {
+                append_log(format!("hotkey parse failed: {error}"));
                 self.start_hidden_effective = false;
                 self.startup_hide_pending = false;
+                self.runtime_shared.hotkey_id.store(0, Ordering::SeqCst);
                 self.status_message = error;
             }
         }
     }
 
-    fn handle_external_events(&mut self, ctx: &Context) {
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if let Some(tray) = self.tray.as_ref() {
-                if event.id == tray.show_hide_id {
-                    self.toggle_visibility(ctx);
-                } else if event.id == tray.settings_id {
-                    self.show_window(ctx);
-                    self.show_settings = true;
-                } else if event.id == tray.quit_id {
-                    self.quit_requested = true;
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                }
-            }
-        }
-
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::DoubleClick { button, .. } = event {
-                if button == MouseButton::Left {
-                    self.toggle_visibility(ctx);
-                }
-            }
-        }
-
-        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if self
-                .registered_hotkey
-                .as_ref()
-                .map(|hotkey| hotkey.id() == event.id)
-                .unwrap_or(false)
-            {
-                self.toggle_visibility(ctx);
-            }
+    fn sync_runtime_requests(&mut self) {
+        self.window_visible = self.runtime_shared.window_visible.load(Ordering::SeqCst);
+        if self
+            .runtime_shared
+            .open_settings
+            .swap(false, Ordering::SeqCst)
+        {
+            self.settings_hotkey_input = self.settings.hotkey.clone();
+            self.settings_start_hidden = self.settings.start_hidden_in_tray;
+            self.show_settings = true;
         }
     }
 
@@ -708,9 +727,10 @@ impl ClipboardDiaryApp {
 
 impl App for ClipboardDiaryApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        self.handle_external_events(ctx);
+        self.sync_runtime_requests();
 
         if self.startup_hide_pending {
+            append_log("startup_hide_pending fired");
             self.startup_hide_pending = false;
             if self.start_hidden_requested && self.start_hidden_effective && self.tray.is_some() {
                 self.hide_window(ctx);
@@ -724,6 +744,7 @@ impl App for ClipboardDiaryApp {
         }
 
         if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
+            append_log("viewport close requested");
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             if self.tray.is_some() {
                 self.hide_window(ctx);
@@ -823,6 +844,22 @@ fn settings_path() -> PathBuf {
     app_data_dir().join("settings.json")
 }
 
+fn log_path() -> PathBuf {
+    app_data_dir().join("runtime.log")
+}
+
+fn append_log(message: impl AsRef<str>) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let line = format!("[{timestamp}] {}\n", message.as_ref());
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path())
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 fn load_history(path: &PathBuf) -> Vec<ClipboardEntry> {
     match fs::read_to_string(path) {
         Ok(content) => serde_json::from_str::<Vec<ClipboardEntry>>(&content).unwrap_or_default(),
@@ -849,42 +886,18 @@ fn save_settings(path: &PathBuf, settings: &AppSettings) -> Result<(), String> {
 }
 
 fn read_clipboard_text() -> Result<String, String> {
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
-        .output()
-        .map_err(|error| error.to_string())?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .replace("\r\n", "\n")
-        .trim_end_matches('\n')
-        .to_string())
+    let mut clipboard = Clipboard::new().map_err(|error| error.to_string())?;
+    clipboard
+        .get_text()
+        .map(|text| text.replace("\r\n", "\n").trim_end_matches('\n').to_string())
+        .map_err(|error| error.to_string())
 }
 
 fn write_clipboard_text(content: &str) -> Result<(), String> {
-    let mut child = Command::new("powershell")
-        .args(["-NoProfile", "-Command", "$input | Set-Clipboard"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(content.as_bytes())
-            .map_err(|error| error.to_string())?;
-    }
-
-    let output = child.wait_with_output().map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    let mut clipboard = Clipboard::new().map_err(|error| error.to_string())?;
+    clipboard
+        .set_text(content.to_string())
+        .map_err(|error| error.to_string())
 }
 
 fn now_millis() -> u64 {
@@ -924,17 +937,21 @@ fn parse_hotkey_setting(value: &str) -> Result<Option<HotKey>, String> {
 }
 
 fn apply_window_visibility(ctx: &Context, visible: bool) {
-    ctx.send_viewport_cmd(ViewportCommand::Visible(visible));
+    append_log(format!("apply_window_visibility visible={visible}"));
     if visible {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
             egui::UserAttentionType::Informational,
         ));
+    } else {
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
     }
 }
 
 fn create_tray() -> Result<TrayHandles, String> {
+    append_log("create_tray start");
     let menu = Menu::new();
     let show_hide = MenuItem::new("Show / Hide", true, None);
     let settings = MenuItem::new("Settings", true, None);
@@ -952,12 +969,121 @@ fn create_tray() -> Result<TrayHandles, String> {
         .build()
         .map_err(|error| error.to_string())?;
 
+    append_log("create_tray success");
+
     Ok(TrayHandles {
         _tray: tray,
         show_hide_id: show_hide.id().clone(),
         settings_id: settings.id().clone(),
         quit_id: quit.id().clone(),
     })
+}
+
+fn spawn_external_event_forwarders(
+    ctx: Context,
+    shared: Arc<RuntimeShared>,
+    show_hide_id: MenuId,
+    settings_id: MenuId,
+    quit_id: MenuId,
+) {
+    let menu_ctx = ctx.clone();
+    let menu_shared = Arc::clone(&shared);
+    thread::spawn(move || loop {
+        match MenuEvent::receiver().recv() {
+            Ok(event) => {
+                append_log(format!("tray menu event: {}", event.id.0));
+                if event.id == show_hide_id {
+                    if should_toggle_now(&menu_shared.last_tray_toggle) {
+                        let currently_visible = menu_shared.window_visible.load(Ordering::SeqCst);
+                        let next_visible = !currently_visible;
+                        append_log(format!("tray menu toggle -> visible={next_visible}"));
+                        menu_shared
+                            .window_visible
+                            .store(next_visible, Ordering::SeqCst);
+                        apply_window_visibility(&menu_ctx, next_visible);
+                    } else {
+                        append_log("tray menu toggle ignored (debounced)");
+                    }
+                } else if event.id == settings_id {
+                    menu_shared.window_visible.store(true, Ordering::SeqCst);
+                    menu_shared.open_settings.store(true, Ordering::SeqCst);
+                    append_log("tray menu settings -> visible=true");
+                    apply_window_visibility(&menu_ctx, true);
+                } else if event.id == quit_id {
+                    append_log("tray menu quit");
+                    menu_ctx.send_viewport_cmd(ViewportCommand::Close);
+                    break;
+                }
+                menu_ctx.request_repaint();
+            }
+            Err(_) => break,
+        }
+    });
+
+    let click_ctx = ctx.clone();
+    let click_shared = Arc::clone(&shared);
+    thread::spawn(move || loop {
+        match TrayIconEvent::receiver().recv() {
+            Ok(TrayIconEvent::DoubleClick { button, .. }) => {
+                append_log(format!("tray double click: {:?}", button));
+                if button == MouseButton::Left {
+                    if should_toggle_now(&click_shared.last_tray_toggle) {
+                        let currently_visible = click_shared.window_visible.load(Ordering::SeqCst);
+                        let next_visible = !currently_visible;
+                        append_log(format!("tray double click toggle -> visible={next_visible}"));
+                        click_shared
+                            .window_visible
+                            .store(next_visible, Ordering::SeqCst);
+                        apply_window_visibility(&click_ctx, next_visible);
+                        click_ctx.request_repaint();
+                    } else {
+                        append_log("tray double click ignored (debounced)");
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    });
+
+    thread::spawn(move || loop {
+        match GlobalHotKeyEvent::receiver().recv() {
+            Ok(event) => {
+                append_log(format!("global hotkey event: {}", event.id));
+                let registered_id = shared.hotkey_id.load(Ordering::SeqCst);
+                if registered_id != 0 && registered_id == event.id {
+                    if should_toggle_now(&shared.last_hotkey_toggle) {
+                        let currently_visible = shared.window_visible.load(Ordering::SeqCst);
+                        let next_visible = !currently_visible;
+                        append_log(format!("hotkey toggle -> visible={next_visible}"));
+                        shared.window_visible.store(next_visible, Ordering::SeqCst);
+                        apply_window_visibility(&ctx, next_visible);
+                        ctx.request_repaint();
+                    } else {
+                        append_log("hotkey toggle ignored (debounced)");
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    });
+}
+
+fn should_toggle_now(last_toggle: &Mutex<Option<Instant>>) -> bool {
+    let mut guard = match last_toggle.lock() {
+        Ok(guard) => guard,
+        Err(_) => return true,
+    };
+
+    let now = Instant::now();
+    if let Some(previous) = *guard {
+        if now.duration_since(previous) < Duration::from_millis(300) {
+            return false;
+        }
+    }
+
+    *guard = Some(now);
+    true
 }
 
 fn build_tray_icon_rgba() -> Vec<u8> {
@@ -981,6 +1107,7 @@ fn build_tray_icon_rgba() -> Vec<u8> {
 }
 
 pub fn run() -> eframe::Result {
+    append_log("app run start");
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Clipdiary (Clipboard history : All clips)")

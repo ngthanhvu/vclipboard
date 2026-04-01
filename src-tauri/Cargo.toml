@@ -1,15 +1,20 @@
 [package]
-name = "rust"
+name = "clipboard_diary"
 version = "0.1.0"
 description = "Clipboard history desktop app"
 authors = ["you"]
 edition = "2021"
 
 [lib]
-name = "rust_lib"
+name = "clipboard_diary_lib"
 crate-type = ["rlib"]
 
+[[bin]]
+name = "ClipboardDiary"
+path = "src/main.rs"
+
 [dependencies]
+arboard = "3.6.1"
 chrono = { version = "0.4", default-features = true, features = ["clock"] }
 directories = "5"
 eframe = "0.33.3"
