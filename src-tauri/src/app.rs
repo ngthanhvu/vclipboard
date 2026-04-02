@@ -1,7 +1,8 @@
 use eframe::{
     egui::{
-        self, Align, Align2, Button, Color32, Context, Frame, Key, Layout, Margin, RichText,
-        Sense, Stroke, TextEdit, TopBottomPanel, Ui, Vec2, ViewportCommand,
+        self, Align, Align2, Button, Color32, Context, Frame, Key, KeyboardShortcut, Layout,
+        Margin, Modifiers, RichText, Sense, Stroke, TextEdit, TopBottomPanel, Ui, Vec2,
+        ViewportCommand,
     },
     App, CreationContext,
 };
@@ -21,7 +22,7 @@ use crate::{
         app_storage_path, append_log, format_timestamp, load_settings, save_settings,
         settings_path, truncate,
     },
-    types::{AppSettings, ClipboardEntry, HistoryStore, RuntimeShared, TrayHandles},
+    types::{AppSettings, ClipboardEntry, ClipboardEntryKind, HistoryStore, RuntimeShared, TrayHandles},
 };
 
 pub(crate) struct ClipboardDiaryApp {
@@ -43,6 +44,7 @@ pub(crate) struct ClipboardDiaryApp {
     settings_hotkey_input: String,
     settings_start_hidden: bool,
     capturing_hotkey: bool,
+    search_has_focus: bool,
     runtime_shared: Arc<RuntimeShared>,
 }
 
@@ -111,6 +113,7 @@ impl ClipboardDiaryApp {
             settings_hotkey_input,
             settings_start_hidden,
             capturing_hotkey: false,
+            search_has_focus: false,
             runtime_shared,
         };
         app.apply_hotkey_setting();
@@ -160,13 +163,25 @@ impl ClipboardDiaryApp {
 
     fn copy_selected(&mut self, items: &[ClipboardEntry]) {
         if let Some(entry) = self.selected_entry(items) {
+            append_log(format!(
+                "copy_selected attempt: id={} kind={:?} preview={}",
+                entry.id,
+                entry.kind,
+                truncate(&entry.preview, 48)
+            ));
             match self.store.copy_entry(&entry.id) {
                 Ok(()) => {
+                    append_log(format!("copy_selected success: id={}", entry.id));
                     self.status_message =
                         format!("Copied '{}' back to clipboard", truncate(&entry.preview, 36));
                 }
-                Err(error) => self.status_message = error,
+                Err(error) => {
+                    append_log(format!("copy_selected failed: id={} error={error}", entry.id));
+                    self.status_message = error;
+                }
             }
+        } else {
+            append_log("copy_selected skipped: no selected entry");
         }
     }
 
@@ -194,15 +209,34 @@ impl ClipboardDiaryApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
-        if ctx.wants_keyboard_input() {
+        if self.show_settings || self.capturing_hotkey || self.search_has_focus {
+            append_log(format!(
+                "ctrl+c skipped: settings_open={} capturing_hotkey={} search_has_focus={}",
+                self.show_settings, self.capturing_hotkey, self.search_has_focus
+            ));
             return;
         }
 
-        let copy_pressed = ctx.input(|input| {
-            (input.modifiers.ctrl || input.modifiers.command) && input.key_pressed(Key::C)
+        let copy_pressed = ctx.input_mut(|input| {
+            input.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::C))
+                || input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::C))
+        });
+        let copy_event_detected = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy))
         });
 
-        if copy_pressed {
+        if copy_pressed || copy_event_detected {
+            append_log(format!(
+                "ctrl+c detected: selected_id={} shortcut={} event_copy={}",
+                self.selected_id
+                    .as_deref()
+                    .unwrap_or("<none>"),
+                copy_pressed,
+                copy_event_detected
+            ));
             let items = self.filtered_history();
             self.copy_selected(&items);
         }
@@ -448,7 +482,16 @@ impl ClipboardDiaryApp {
     fn bottom_bar(&mut self, ctx: &Context, visible_count: usize, total_count: usize) {
         let selected_summary = self
             .selected_entry(&self.filtered_history())
-            .map(|entry| format!("{} chars | {} lines", entry.character_count, entry.line_count))
+            .map(|entry| match entry.kind {
+                ClipboardEntryKind::Text => {
+                    format!("{} chars | {} lines", entry.character_count, entry.line_count)
+                }
+                ClipboardEntryKind::Image => format!(
+                    "Image {}x{}",
+                    entry.image_width.unwrap_or_default(),
+                    entry.image_height.unwrap_or_default()
+                ),
+            })
             .unwrap_or_else(|| String::from("No selection"));
 
         TopBottomPanel::bottom("status_bar")
@@ -459,10 +502,11 @@ impl ClipboardDiaryApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_sized(
+                    let search_response = ui.add_sized(
                         [140.0, 22.0],
                         TextEdit::singleline(&mut self.search).hint_text("Search clips..."),
                     );
+                    self.search_has_focus = search_response.has_focus();
                     ui.separator();
                     ui.label(
                         RichText::new(format!("{visible_count}/{total_count} clips"))
@@ -549,7 +593,11 @@ impl ClipboardDiaryApp {
 
                             // Cột icon
                             row.col(|ui| {
-                                let icon = if entry.line_count > 1 { "S" } else { "T" };
+                                let icon = match entry.kind {
+                                    ClipboardEntryKind::Image => "I",
+                                    ClipboardEntryKind::Text if entry.line_count > 1 => "S",
+                                    ClipboardEntryKind::Text => "T",
+                                };
                                 let text = RichText::new(icon)
                                     .strong()
                                     .color(if is_selected {
@@ -566,6 +614,8 @@ impl ClipboardDiaryApp {
                                     )
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                                 if response.clicked() {
+                                    ui.ctx().memory_mut(|mem| mem.stop_text_input());
+                                    append_log(format!("row icon clicked: id={}", entry.id));
                                     self.selected_id = Some(entry.id.clone());
                                 }
                             });
@@ -602,17 +652,30 @@ impl ClipboardDiaryApp {
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
 
                                 if response.clicked() {
+                                    ui.ctx().memory_mut(|mem| mem.stop_text_input());
+                                    append_log(format!("row clicked: id={}", entry.id));
                                     self.selected_id = Some(entry.id.clone());
                                 }
                                 if response.double_clicked() {
+                                    append_log(format!("row double clicked: id={}", entry.id));
                                     match self.store.copy_entry(&entry.id) {
                                         Ok(()) => {
+                                            append_log(format!(
+                                                "row double click copy success: id={}",
+                                                entry.id
+                                            ));
                                             self.status_message = format!(
                                                 "Copied '{}' back to clipboard",
                                                 truncate(&entry.preview, 36)
                                             );
                                         }
-                                        Err(error) => self.status_message = error,
+                                        Err(error) => {
+                                            append_log(format!(
+                                                "row double click copy failed: id={} error={error}",
+                                                entry.id
+                                            ));
+                                            self.status_message = error;
+                                        }
                                     }
                                 }
                                 response.clone().context_menu(|ui| {

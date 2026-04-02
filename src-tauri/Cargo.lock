@@ -3890,6 +3890,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "global-hotkey",
+ "image",
  "raw-window-handle",
  "serde",
  "serde_json",

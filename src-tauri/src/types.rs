@@ -1,6 +1,8 @@
 use eframe::egui::Context;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
@@ -12,7 +14,8 @@ use std::{
 use tray_icon::{menu::MenuId, TrayIcon};
 
 use crate::storage::{
-    build_entry, load_history, read_clipboard_text, save_history, write_clipboard_text,
+    build_entry, delete_entry_assets, load_history, read_clipboard_content, save_history,
+    write_clipboard_entry,
 };
 
 pub(crate) const MAX_HISTORY_ITEMS: usize = 250;
@@ -26,6 +29,66 @@ pub(crate) struct ClipboardEntry {
     pub(crate) created_at: u64,
     pub(crate) character_count: usize,
     pub(crate) line_count: usize,
+    #[serde(default)]
+    pub(crate) kind: ClipboardEntryKind,
+    #[serde(default)]
+    pub(crate) image_path: Option<String>,
+    #[serde(default)]
+    pub(crate) image_width: Option<usize>,
+    #[serde(default)]
+    pub(crate) image_height: Option<usize>,
+    #[serde(default)]
+    pub(crate) content_signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) enum ClipboardEntryKind {
+    #[default]
+    Text,
+    Image,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ClipboardContent {
+    Text {
+        text: String,
+    },
+    Image {
+        png_relative_path: String,
+        width: usize,
+        height: usize,
+        rgba_bytes: Vec<u8>,
+    },
+}
+
+impl ClipboardContent {
+    pub(crate) fn signature(&self) -> String {
+        match self {
+            Self::Text { text } => format!("text:{text}"),
+            Self::Image {
+                width,
+                height,
+                rgba_bytes,
+                ..
+            } => {
+                let mut hasher = DefaultHasher::new();
+                rgba_bytes.hash(&mut hasher);
+                format!("image:{width}x{height}:{}", hasher.finish())
+            }
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Text { text } => text.trim().is_empty(),
+            Self::Image {
+                width,
+                height,
+                rgba_bytes,
+                ..
+            } => *width == 0 || *height == 0 || rgba_bytes.is_empty(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,14 +155,15 @@ impl HistoryStore {
                 .items
                 .lock()
                 .ok()
-                .and_then(|items| items.first().map(|entry| entry.content.clone()))
+                .and_then(|items| items.first().map(|entry| entry.content_signature.clone()))
                 .unwrap_or_default();
 
             loop {
-                if let Ok(content) = read_clipboard_text() {
-                    if !content.trim().is_empty() && content != last_clipboard {
-                        if store.record_content(content.clone()).is_some() {
-                            last_clipboard = content;
+                if let Ok(content) = read_clipboard_content() {
+                    let signature = content.signature();
+                    if !content.is_empty() && signature != last_clipboard {
+                        if let Some(entry) = store.record_content(content) {
+                            last_clipboard = entry.content_signature.clone();
                             ctx.request_repaint();
                         }
                     }
@@ -110,22 +174,33 @@ impl HistoryStore {
         });
     }
 
-    pub(crate) fn record_content(&self, content: String) -> Option<ClipboardEntry> {
+    pub(crate) fn record_content(&self, content: ClipboardContent) -> Option<ClipboardEntry> {
         let entry = build_entry(content);
         let mut items = self.items.lock().ok()?;
 
         if items
             .first()
-            .map(|current| current.content == entry.content)
+            .map(|current| current.content_signature == entry.content_signature)
             .unwrap_or(false)
         {
             return None;
         }
 
-        items.retain(|item| item.content != entry.content);
+        let removed: Vec<ClipboardEntry> = items
+            .iter()
+            .filter(|item| item.content_signature == entry.content_signature)
+            .cloned()
+            .collect();
+        items.retain(|item| item.content_signature != entry.content_signature);
+        for item in removed {
+            delete_entry_assets(&item);
+        }
         items.insert(0, entry.clone());
         if items.len() > MAX_HISTORY_ITEMS {
-            items.truncate(MAX_HISTORY_ITEMS);
+            let overflow = items.split_off(MAX_HISTORY_ITEMS);
+            for item in overflow {
+                delete_entry_assets(&item);
+            }
         }
         save_history(&self.storage_path, &items);
         Some(entry)
@@ -138,8 +213,7 @@ impl HistoryStore {
             .find(|item| item.id == id)
             .ok_or_else(|| String::from("Khong tim thay clip can copy"))?;
 
-        write_clipboard_text(&entry.content)?;
-        let _ = self.record_content(entry.content);
+        write_clipboard_entry(&entry)?;
         Ok(())
     }
 
@@ -149,9 +223,17 @@ impl HistoryStore {
             .lock()
             .map_err(|_| String::from("Khong the truy cap lich su clipboard"))?;
         let original_len = items.len();
+        let removed: Vec<ClipboardEntry> = items
+            .iter()
+            .filter(|item| item.id == id)
+            .cloned()
+            .collect();
         items.retain(|item| item.id != id);
         if items.len() == original_len {
             return Err(String::from("Khong tim thay muc can xoa"));
+        }
+        for item in removed {
+            delete_entry_assets(&item);
         }
         save_history(&self.storage_path, &items);
         Ok(())
@@ -162,7 +244,11 @@ impl HistoryStore {
             .items
             .lock()
             .map_err(|_| String::from("Khong the truy cap lich su clipboard"))?;
+        let removed = items.clone();
         items.clear();
+        for item in removed {
+            delete_entry_assets(&item);
+        }
         save_history(&self.storage_path, &items);
         Ok(())
     }
