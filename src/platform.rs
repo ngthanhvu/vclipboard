@@ -353,9 +353,9 @@ fn should_toggle_now(last_toggle: &Mutex<Option<Instant>>) -> bool {
 }
 
 fn load_tray_icon() -> Result<IconData, String> {
-    from_png_bytes(include_bytes!("../../assets/16x16.png")).map_err(|error| error.to_string())
+    from_png_bytes(include_bytes!("../assets/16x16.png")).map_err(|error| error.to_string())
 }
 
 pub(crate) fn load_window_icon() -> Result<IconData, String> {
-    from_png_bytes(include_bytes!("../../assets/256x256.png")).map_err(|error| error.to_string())
+    from_png_bytes(include_bytes!("../assets/256x256.png")).map_err(|error| error.to_string())
 }

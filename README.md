@@ -1,33 +1,33 @@
 # Clipboard Diary
 
-Clipboard manager native cho Windows, viết bằng Rust + `egui/eframe`, đi theo hướng giao diện giống Clipdiary.
+Clipboard manager native cho Windows, viet bang Rust + `egui/eframe`.
 
-## Chạy app để test
+## Chay app
 
-Từ thư mục gốc project:
-
-```powershell
-cargo run --manifest-path src-tauri/Cargo.toml
-```
-
-App sẽ mở cửa sổ desktop native và tự theo dõi clipboard text của Windows.
-
-## Cách test nhanh
-
-1. Chạy lệnh ở trên.
-2. Mở Notepad, VS Code hoặc browser rồi copy vài đoạn text khác nhau.
-3. Quay lại app để xem lịch sử clipboard được thêm vào danh sách.
-4. Double click một dòng để copy lại.
-5. Chuột phải vào item để thử `Copy to clipboard` hoặc `Delete`.
-
-## Build kiểm tra
+Tu thu muc goc project:
 
 ```powershell
-cargo check --manifest-path src-tauri/Cargo.toml
+cargo run
 ```
 
-## Cấu trúc còn lại
+App se mo cua so desktop native va theo doi clipboard tren Windows.
 
-- `src-tauri/src/lib.rs`: logic app egui + clipboard history
-- `src-tauri/src/main.rs`: entry point native
-- `src-tauri/Cargo.toml`: dependencies Rust
+## Test nhanh
+
+1. Chay `cargo run`.
+2. Mo Notepad, VS Code hoac browser roi copy vai doan text khac nhau.
+3. Quay lai app de xem lich su clipboard duoc them vao danh sach.
+4. Double click mot dong de copy lai.
+5. Chuot phai vao item de thu `Copy to clipboard` hoac `Delete`.
+
+## Build kiem tra
+
+```powershell
+cargo check
+```
+
+## Cau truc
+
+- `src/lib.rs`: logic app egui + clipboard history
+- `src/main.rs`: entry point native
+- `Cargo.toml`: dependencies Rust

@@ -596,13 +596,13 @@ impl ClipboardDiaryApp {
                             row.col(|ui| {
                                 let icon = match entry.kind {
                                     ClipboardEntryKind::Image => {
-                                        egui::include_image!("../../assets/images.svg")
+                                        egui::include_image!("../assets/images.svg")
                                     }
                                     ClipboardEntryKind::Text if entry.line_count > 1 => {
-                                        egui::include_image!("../../assets/mutiline.svg")
+                                        egui::include_image!("../assets/mutiline.svg")
                                     }
                                     ClipboardEntryKind::Text => {
-                                        egui::include_image!("../../assets/text.svg")
+                                        egui::include_image!("../assets/text.svg")
                                     }
                                 };
                                 let tint = if is_selected {
