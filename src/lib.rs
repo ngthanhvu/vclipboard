@@ -4,11 +4,16 @@ mod storage;
 mod types;
 
 use app::ClipboardDiaryApp;
-use eframe::{egui, NativeOptions};
+use eframe::{egui, NativeOptions, Renderer};
 use platform::load_window_icon;
 use storage::append_log;
+use std::panic;
 
 pub fn run() -> eframe::Result {
+    panic::set_hook(Box::new(|panic_info| {
+        append_log(format!("panic: {panic_info}"));
+    }));
+
     let viewport = {
         let builder = egui::ViewportBuilder::default()
             .with_title("Vclipboard (All clips)")
@@ -27,12 +32,21 @@ pub fn run() -> eframe::Result {
     append_log("app run start");
     let native_options = NativeOptions {
         viewport,
+        renderer: Renderer::Wgpu,
         ..Default::default()
     };
+    append_log("app native renderer: wgpu");
 
-    eframe::run_native(
+    let run_result = eframe::run_native(
         "Vclipboard",
         native_options,
         Box::new(|cc| Ok(Box::new(ClipboardDiaryApp::new(cc)))),
-    )
+    );
+
+    match &run_result {
+        Ok(()) => append_log("app run exit ok"),
+        Err(error) => append_log(format!("app run exit error: {error}")),
+    }
+
+    run_result
 }

@@ -76,7 +76,7 @@ pub(crate) fn build_preview(content: &str) -> String {
 }
 
 fn app_data_dir() -> PathBuf {
-    if let Some(project_dirs) = ProjectDirs::from("com", "ngthanhvu", "Vclipboard") {
+    if let Some(project_dirs) = ProjectDirs::from("com", "Vclipboard", "Vclipboard") {
         let base_dir = project_dirs.data_dir();
         let _ = fs::create_dir_all(base_dir);
         return base_dir.to_path_buf();

@@ -158,7 +158,11 @@ pub(crate) fn capture_native_window_handle(cc: &CreationContext<'_>) -> Option<i
 }
 
 pub(crate) fn apply_window_visibility(ctx: &Context, shared: &RuntimeShared, visible: bool) {
-    append_log(format!("apply_window_visibility visible={visible}"));
+    append_log(format!(
+        "apply_window_visibility visible={} hwnd={}",
+        visible,
+        shared.native_hwnd.load(Ordering::SeqCst)
+    ));
     apply_native_window_visibility(shared, visible);
     if visible {
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
@@ -174,6 +178,7 @@ pub(crate) fn apply_window_visibility(ctx: &Context, shared: &RuntimeShared, vis
 fn apply_native_window_visibility(shared: &RuntimeShared, visible: bool) {
     let hwnd = shared.native_hwnd.load(Ordering::SeqCst);
     if hwnd == 0 {
+        append_log("apply_native_window_visibility skipped: hwnd=0");
         return;
     }
 
@@ -200,6 +205,10 @@ fn apply_native_window_visibility(shared: &RuntimeShared, visible: bool) {
                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+        append_log(format!(
+            "apply_native_window_visibility hwnd={} visible={} ex_style=0x{ex_style:08x} next_style=0x{next_style:08x}",
+            hwnd, visible
+        ));
 
         if visible {
             ShowWindow(hwnd, SW_RESTORE);

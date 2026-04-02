@@ -46,6 +46,7 @@ pub(crate) struct ClipboardDiaryApp {
     capturing_hotkey: bool,
     search_has_focus: bool,
     runtime_shared: Arc<RuntimeShared>,
+    first_update_logged: bool,
 }
 
 impl ClipboardDiaryApp {
@@ -54,9 +55,12 @@ impl ClipboardDiaryApp {
         install_image_loaders(&cc.egui_ctx);
 
         let storage_path = app_storage_path();
+        append_log(format!("app new: storage_path={}", storage_path.display()));
         let store = Arc::new(HistoryStore::new(storage_path));
         store.start_monitor(cc.egui_ctx.clone());
-        let settings = load_settings(&settings_path());
+        let settings_file = settings_path();
+        append_log(format!("app new: settings_path={}", settings_file.display()));
+        let settings = load_settings(&settings_file);
         let hotkey_manager = GlobalHotKeyManager::new().ok();
         let (tray, tray_error) = match create_tray() {
             Ok(tray) => (Some(tray), None),
@@ -86,6 +90,16 @@ impl ClipboardDiaryApp {
                 tray_handles.quit_id.clone(),
             );
         }
+        append_log(format!(
+            "app new state: hwnd={} tray_available={} tray_error={} hotkey_manager_available={} start_hidden_requested={} startup_hide_pending={} settings_hotkey='{}'",
+            runtime_shared.native_hwnd.load(Ordering::SeqCst),
+            tray_available,
+            tray_error.as_deref().unwrap_or("<none>"),
+            hotkey_manager.is_some(),
+            startup_hidden,
+            startup_hide_pending,
+            settings.hotkey
+        ));
         let initial_status = if let Some(error) = tray_error.as_ref() {
             format!("Tray icon unavailable, starting visible: {error}")
         } else if startup_hidden {
@@ -116,6 +130,7 @@ impl ClipboardDiaryApp {
             capturing_hotkey: false,
             search_has_focus: false,
             runtime_shared,
+            first_update_logged: false,
         };
         app.apply_hotkey_setting();
         if app.tray.is_none() {
@@ -125,6 +140,14 @@ impl ClipboardDiaryApp {
             app.status_message =
                 String::from("");
         }
+        append_log(format!(
+            "app new complete: status='{}' selected_id={} history_items={} start_hidden_effective={} window_visible={}",
+            app.status_message,
+            app.selected_id.as_deref().unwrap_or("<none>"),
+            app.store.history().len(),
+            app.start_hidden_effective,
+            app.window_visible
+        ));
         app
     }
 
@@ -726,6 +749,23 @@ impl ClipboardDiaryApp {
 
 impl App for ClipboardDiaryApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        if !self.first_update_logged {
+            self.first_update_logged = true;
+            let viewport = ctx.input(|input| input.viewport().clone());
+            append_log(format!(
+                "first update: window_visible={} close_requested={} focused={} native_hwnd={} outer_rect={:?} inner_rect={:?} minimized={:?} maximized={:?} fullscreen={:?}",
+                self.window_visible,
+                viewport.close_requested(),
+                ctx.input(|input| input.focused),
+                self.runtime_shared.native_hwnd.load(Ordering::SeqCst),
+                viewport.outer_rect,
+                viewport.inner_rect,
+                viewport.minimized,
+                viewport.maximized,
+                viewport.fullscreen
+            ));
+        }
+
         self.sync_runtime_requests();
         self.handle_shortcuts(ctx);
 
