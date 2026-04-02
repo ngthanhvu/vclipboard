@@ -4,6 +4,7 @@ use directories::ProjectDirs;
 use image::{ColorType, ImageEncoder};
 use std::{
     borrow::Cow,
+    collections::HashSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -35,29 +36,32 @@ pub(crate) fn build_entry(content: ClipboardContent) -> ClipboardEntry {
             }
         }
         ClipboardContent::Image {
-            png_relative_path,
             width,
             height,
             rgba_bytes,
-        } => ClipboardEntry {
-            id: format!("{created_at}-img-{width}x{height}"),
-            content: String::new(),
-            preview: format!("Image {width}x{height}"),
-            created_at,
-            character_count: rgba_bytes.len(),
-            line_count: 1,
-            kind: ClipboardEntryKind::Image,
-            image_path: Some(png_relative_path),
-            image_width: Some(width),
-            image_height: Some(height),
-            content_signature: ClipboardContent::Image {
-                png_relative_path: String::new(),
+        } => {
+            let content_signature = ClipboardContent::Image {
                 width,
                 height,
-                rgba_bytes,
+                rgba_bytes: rgba_bytes.clone(),
             }
-            .signature(),
-        },
+            .signature();
+            let image_path = save_clipboard_image(width, height, &rgba_bytes).ok();
+
+            ClipboardEntry {
+                id: format!("{created_at}-img-{width}x{height}"),
+                content: String::new(),
+                preview: format!("Image {width}x{height}"),
+                created_at,
+                character_count: rgba_bytes.len(),
+                line_count: 1,
+                kind: ClipboardEntryKind::Image,
+                image_path,
+                image_width: Some(width),
+                image_height: Some(height),
+                content_signature,
+            }
+        }
     }
 }
 
@@ -153,9 +157,7 @@ pub(crate) fn read_clipboard_content() -> Result<ClipboardContent, String> {
 
     let image = clipboard.get_image().map_err(|error| error.to_string())?;
     let rgba_bytes = image.bytes.into_owned();
-    let relative_path = save_clipboard_image(image.width, image.height, &rgba_bytes)?;
     Ok(ClipboardContent::Image {
-        png_relative_path: relative_path,
         width: image.width,
         height: image.height,
         rgba_bytes,
@@ -192,6 +194,32 @@ pub(crate) fn write_clipboard_entry(entry: &ClipboardEntry) -> Result<(), String
 pub(crate) fn delete_entry_assets(entry: &ClipboardEntry) {
     if let Some(path) = entry.image_path.as_ref() {
         let _ = fs::remove_file(app_data_dir().join(path));
+    }
+}
+
+pub(crate) fn clear_image_assets_dir() {
+    let dir = images_dir();
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::create_dir_all(&dir);
+}
+
+pub(crate) fn cleanup_orphaned_image_assets(items: &[ClipboardEntry]) {
+    let dir = images_dir();
+    let referenced_paths: HashSet<PathBuf> = items
+        .iter()
+        .filter_map(|entry| entry.image_path.as_ref())
+        .map(|path| app_data_dir().join(path))
+        .collect();
+
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let full_path = entry.path();
+        if full_path.is_file() && !referenced_paths.contains(&full_path) {
+            let _ = fs::remove_file(full_path);
+        }
     }
 }
 

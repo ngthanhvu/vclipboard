@@ -14,8 +14,8 @@ use std::{
 use tray_icon::{menu::MenuId, TrayIcon};
 
 use crate::storage::{
-    build_entry, delete_entry_assets, load_history, read_clipboard_content, save_history,
-    write_clipboard_entry,
+    build_entry, cleanup_orphaned_image_assets, clear_image_assets_dir, delete_entry_assets,
+    load_history, read_clipboard_content, save_history, write_clipboard_entry,
 };
 
 pub(crate) const MAX_HISTORY_ITEMS: usize = 250;
@@ -54,7 +54,6 @@ pub(crate) enum ClipboardContent {
         text: String,
     },
     Image {
-        png_relative_path: String,
         width: usize,
         height: usize,
         rgba_bytes: Vec<u8>,
@@ -130,8 +129,10 @@ pub(crate) struct HistoryStore {
 
 impl HistoryStore {
     pub(crate) fn new(storage_path: PathBuf) -> Self {
+        let items = load_history(&storage_path);
+        cleanup_orphaned_image_assets(&items);
         Self {
-            items: Mutex::new(load_history(&storage_path)),
+            items: Mutex::new(items),
             storage_path,
             monitor_started: AtomicBool::new(false),
         }
@@ -244,11 +245,8 @@ impl HistoryStore {
             .items
             .lock()
             .map_err(|_| String::from("Khong the truy cap lich su clipboard"))?;
-        let removed = items.clone();
         items.clear();
-        for item in removed {
-            delete_entry_assets(&item);
-        }
+        clear_image_assets_dir();
         save_history(&self.storage_path, &items);
         Ok(())
     }

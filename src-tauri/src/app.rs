@@ -6,7 +6,7 @@ use eframe::{
     },
     App, CreationContext,
 };
-use egui_extras::{Column, TableBuilder};
+use egui_extras::{install_image_loaders, Column, TableBuilder};
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyManager};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
@@ -51,6 +51,7 @@ pub(crate) struct ClipboardDiaryApp {
 impl ClipboardDiaryApp {
     pub(crate) fn new(cc: &CreationContext<'_>) -> Self {
         configure_visuals(&cc.egui_ctx);
+        install_image_loaders(&cc.egui_ctx);
 
         let storage_path = app_storage_path();
         let store = Arc::new(HistoryStore::new(storage_path));
@@ -122,7 +123,7 @@ impl ClipboardDiaryApp {
                 String::from("Tray icon unavailable, starting visible for safety");
         } else if app.start_hidden_requested {
             app.status_message =
-                String::from("Start hidden is enabled, but this launch starts visible for safety");
+                String::from("");
         }
         app
     }
@@ -172,8 +173,8 @@ impl ClipboardDiaryApp {
             match self.store.copy_entry(&entry.id) {
                 Ok(()) => {
                     append_log(format!("copy_selected success: id={}", entry.id));
-                    self.status_message =
-                        format!("Copied '{}' back to clipboard", truncate(&entry.preview, 36));
+                    // self.status_message =
+                    //     format!("Copied '{}' back to clipboard", truncate(&entry.preview, 36));
                 }
                 Err(error) => {
                     append_log(format!("copy_selected failed: id={} error={error}", entry.id));
@@ -594,30 +595,31 @@ impl ClipboardDiaryApp {
                             // Cột icon
                             row.col(|ui| {
                                 let icon = match entry.kind {
-                                    ClipboardEntryKind::Image => "I",
-                                    ClipboardEntryKind::Text if entry.line_count > 1 => "S",
-                                    ClipboardEntryKind::Text => "T",
+                                    ClipboardEntryKind::Image => {
+                                        egui::include_image!("../../assets/images.svg")
+                                    }
+                                    ClipboardEntryKind::Text if entry.line_count > 1 => {
+                                        egui::include_image!("../../assets/mutiline.svg")
+                                    }
+                                    ClipboardEntryKind::Text => {
+                                        egui::include_image!("../../assets/text.svg")
+                                    }
                                 };
-                                let text = RichText::new(icon)
-                                    .strong()
-                                    .color(if is_selected {
-                                        Color32::from_rgb(205, 225, 255)
-                                    } else {
-                                        Color32::from_rgb(0, 70, 160)
-                                    });
-                                let response = ui
-                                    .add(
-                                        egui::Label::new(text)
-                                            .halign(Align::Min)
-                                            .sense(Sense::click())
-                                            .selectable(false),
-                                    )
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if response.clicked() {
-                                    ui.ctx().memory_mut(|mem| mem.stop_text_input());
-                                    append_log(format!("row icon clicked: id={}", entry.id));
-                                    self.selected_id = Some(entry.id.clone());
-                                }
+                                let tint = if is_selected {
+                                    Color32::WHITE
+                                } else {
+                                    Color32::from_rgb(0, 70, 160)
+                                };
+                                ui.with_layout(
+                                    Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Image::new(icon)
+                                                .fit_to_exact_size(Vec2::splat(14.0))
+                                                .tint(tint),
+                                        );
+                                    },
+                                );
                             });
 
                             // Cột preview (nội dung chính)
@@ -634,63 +636,18 @@ impl ClipboardDiaryApp {
                                     Color32::from_rgb(38, 38, 38)
                                 });
 
-                                let response = ui
-                                    .allocate_ui_with_layout(
-                                        Vec2::new(ui.available_width(), 18.0),
-                                        Layout::left_to_right(Align::Center),
-                                        |ui| {
-                                            ui.add(
-                                                egui::Label::new(row_text)
-                                                    .truncate()
-                                                    .halign(Align::Min)
-                                                    .selectable(false)
-                                                    .sense(Sense::click()),
-                                            )
-                                        },
-                                    )
-                                    .inner
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-
-                                if response.clicked() {
-                                    ui.ctx().memory_mut(|mem| mem.stop_text_input());
-                                    append_log(format!("row clicked: id={}", entry.id));
-                                    self.selected_id = Some(entry.id.clone());
-                                }
-                                if response.double_clicked() {
-                                    append_log(format!("row double clicked: id={}", entry.id));
-                                    match self.store.copy_entry(&entry.id) {
-                                        Ok(()) => {
-                                            append_log(format!(
-                                                "row double click copy success: id={}",
-                                                entry.id
-                                            ));
-                                            self.status_message = format!(
-                                                "Copied '{}' back to clipboard",
-                                                truncate(&entry.preview, 36)
-                                            );
-                                        }
-                                        Err(error) => {
-                                            append_log(format!(
-                                                "row double click copy failed: id={} error={error}",
-                                                entry.id
-                                            ));
-                                            self.status_message = error;
-                                        }
-                                    }
-                                }
-                                response.clone().context_menu(|ui| {
-                                    if ui.button("Copy to clipboard").clicked() {
-                                        let _ = self.store.copy_entry(&entry.id);
-                                        self.status_message = String::from("Copied selected clip");
-                                        ui.close();
-                                    }
-                                    if ui.button("Delete").clicked() {
-                                        let _ = self.store.delete_entry(&entry.id);
-                                        self.status_message = String::from("Deleted selected clip");
-                                        self.selected_id = None;
-                                        ui.close();
-                                    }
-                                });
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(ui.available_width(), 18.0),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(row_text)
+                                                .truncate()
+                                                .halign(Align::Min)
+                                                .selectable(false),
+                                        )
+                                    },
+                                );
                             });
 
                             // Cột thời gian
@@ -710,7 +667,52 @@ impl ClipboardDiaryApp {
                                 });
                             }
 
-                            let _ = row.response().on_hover_text(&entry.preview);
+                            let row_response = row
+                                .response()
+                                .interact(Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                            if row_response.clicked() {
+                                row_response.ctx.memory_mut(|mem| mem.stop_text_input());
+                                append_log(format!("row clicked: id={}", entry.id));
+                                self.selected_id = Some(entry.id.clone());
+                            }
+                            if row_response.double_clicked() {
+                                append_log(format!("row double clicked: id={}", entry.id));
+                                match self.store.copy_entry(&entry.id) {
+                                    Ok(()) => {
+                                        append_log(format!(
+                                            "row double click copy success: id={}",
+                                            entry.id
+                                        ));
+                                        self.status_message = format!(
+                                            "Copied '{}' back to clipboard",
+                                            truncate(&entry.preview, 36)
+                                        );
+                                    }
+                                    Err(error) => {
+                                        append_log(format!(
+                                            "row double click copy failed: id={} error={error}",
+                                            entry.id
+                                        ));
+                                        self.status_message = error;
+                                    }
+                                }
+                            }
+                            row_response.clone().context_menu(|ui| {
+                                if ui.button("Copy to clipboard").clicked() {
+                                    let _ = self.store.copy_entry(&entry.id);
+                                    self.status_message = String::from("Copied selected clip");
+                                    ui.close();
+                                }
+                                if ui.button("Delete").clicked() {
+                                    let _ = self.store.delete_entry(&entry.id);
+                                    self.status_message = String::from("Deleted selected clip");
+                                    self.selected_id = None;
+                                    ui.close();
+                                }
+                            });
+                            let _ = row_response.on_hover_text(&entry.preview);
                         });
                     });
 
