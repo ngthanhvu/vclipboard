@@ -26,6 +26,14 @@ App se mo cua so desktop native va theo doi clipboard tren Windows.
 cargo check
 ```
 
+## Build tren GitHub
+
+Repo da co workflow [build.yml](c:\Cac-du-an\clipboard\.github\workflows\build.yml) de build tren GitHub Actions.
+
+- Push len `main` hoac `master`: build file `Vclipboard.exe` va installer `Vclipboard-setup.exe`, roi upload thanh artifact.
+- Tao tag dang `v*` nhu `v0.1.0`: workflow se build lai va attach 2 file tren vao GitHub Release.
+- Co the chay tay trong tab Actions bang `workflow_dispatch`.
+
 ## Cau truc
 
 - `src/lib.rs`: logic app egui + clipboard history
